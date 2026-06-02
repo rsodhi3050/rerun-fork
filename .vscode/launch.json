@@ -1,0 +1,196 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        // Python
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        // Rust:
+        {
+            "name": "Lauch C++ minimal example",
+            "type": "cppdbg",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "program": "${workspaceFolder}/build/debug/examples/cpp/minimal/example_minimal",
+            "args": [],
+            "stopAtEntry": false,
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "lldb"
+        },
+        {
+            "name": "Launch tests",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--profile=debugging",
+                    "-p=re_log_encoding",
+                    "--no-run",
+                    "--lib",
+                    "--all-features"
+                ],
+                "filter": {
+                    "kind": "lib"
+                }
+            },
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Debug 'rerun' (no args)",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--profile=debugging",
+                    "--package=rerun-cli",
+                    "--no-default-features",
+                    "--features=native_viewer"
+                ],
+                "filter": {
+                    "name": "rerun",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        },
+        {
+            "name": "Debug 'rerun ../data.rrd'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--profile=debugging",
+                    "--package=rerun-cli",
+                    "--no-default-features",
+                    "--features=native_viewer"
+                ],
+                "filter": {
+                    "name": "rerun",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "../data.rrd"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "debug"
+            }
+        },
+        {
+            "name": "Debug 'rerun' bar_chart.rrd from url",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--profile=debugging",
+                    "--package=rerun-cli",
+                    "--no-default-features",
+                    "--features=native_viewer"
+                ],
+                "filter": {
+                    "name": "rerun",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "https://app.rerun.io/version/0.25.0/examples/snippets/bar_chart.rrd"
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "trace"
+            }
+        },
+        {
+            "name": "Debug 'minimal' example",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--profile=debugging",
+                    "--package=minimal",
+                ],
+                "filter": {
+                    "name": "minimal",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RUST_LOG": "trace"
+            }
+        },
+        {
+            "name": "Debug re_renderer --example=multiview",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--profile=debugging",
+                    "--example=multiview"
+                ],
+                "filter": {
+                    "name": "multiview",
+                    "kind": "example"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Debug 'codegen'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--profile=debugging",
+                    "--package=re_types_builder",
+                ],
+                "filter": {
+                    "name": "build_re_types",
+                    "kind": "bin"
+                }
+            },
+            "args": [
+                "--force" // always run codegen, even if hashes hasn't changed
+            ],
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "RAYON_NUM_THREADS": "1" // less confusing debugging experience
+            }
+        },
+        {
+            "name": "(Windows) Launch & debug C++ snippet",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/debug/docs/snippets/video_auto_frames.exe",
+            "args": [
+                "${workspaceFolder}/tests/assets/video/Big_Buck_Bunny_1080_10s_av1.mp4"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${fileDirname}",
+            "environment": [],
+            "console": "externalTerminal"
+        },
+    ]
+}

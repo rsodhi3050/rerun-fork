@@ -1,0 +1,141 @@
+# https://github.com/EmbarkStudios/cargo-deny
+#
+# cargo-deny checks our dependency tree for copy-left licenses,
+# duplicate dependencies, and rustsec advisories (https://rustsec.org/advisories).
+#
+# Install: `cargo install cargo-deny`
+# Check: `cargo deny check`.
+#
+# For finding duplicate dependencies:  cargo deny check bans --hide-inclusion-graph
+
+
+# Note: running just `cargo deny check` without a `--target` can result in
+# false positives due to https://github.com/EmbarkStudios/cargo-deny/issues/324
+[graph]
+targets = [
+  { triple = "aarch64-apple-darwin" },
+  { triple = "i686-pc-windows-gnu" },
+  { triple = "i686-pc-windows-msvc" },
+  { triple = "i686-unknown-linux-gnu" },
+  { triple = "wasm32-unknown-unknown" },
+  { triple = "x86_64-apple-darwin" },
+  { triple = "x86_64-pc-windows-gnu" },
+  { triple = "x86_64-pc-windows-msvc" },
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "x86_64-unknown-linux-musl" },
+  { triple = "x86_64-unknown-redox" },
+]
+all-features = true
+
+
+[advisories]
+version = 2
+unused-ignored-advisory = "deny"
+ignore = [
+  { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained — https://github.com/dtolnay/paste" },
+  { id = "RUSTSEC-2024-0014", reason = "generational-arena is unmaintained" },
+  { id = "RUSTSEC-2025-0141", reason = "bincode is unmaintained — https://git.sr.ht/~stygianentity/bincode/tree/v3.0/item/README.md" },
+]
+
+
+[bans]
+multiple-versions = "deny"
+wildcards = "allow" # We use them for examples
+deny = [
+  { name = "cgmath", reason = "We use glam" },
+  { name = "cmake", reason = "Never again" },
+  { name = "derive_more", reason = "Is very slow to compile; see https://github.com/rerun-io/rerun/issues/1316" },
+  { name = "egui_glow", reason = "We use wgpu" },
+  { name = "openssl-sys", reason = "We prefer rustls" },
+  { name = "openssl", reason = "We prefer rustls" },
+  { name = "protobuf_src", reason = "We don't want to force users to compile protoc" },
+  # { name = "protoc-prebuilt", reason = "It would be better if 3rd party crates shipped their pre-compiled proto sources" }, # unfortunately, we use this for our objectron example. TODO(emilk): avoid protoc-prebuilt
+
+  # We have to allow egui_kittest since we use it behind a `testing` feature flag, rather than just as a dev-dependency.
+  #{ name = "egui_kittest", reason = "Only allowed as a dev-dependency for testing." },
+
+  # We have to allow insta because it's used by `re_redap_tests`, which contains test code
+  #{ name = "insta", reason = "Only allowed as a dev-dependency for testing." },
+]
+skip = [
+  { name = "base64" }, # Too popular
+  { name = "bitflags" }, # core-graphics & png uses an older version.
+  { name = "block2" }, # Old version via rfd
+  { name = "console" }, # smallish
+  { name = "core-foundation" }, # Currently, e.g. `webbrowser` and `winit` use different versions.
+  { name = "downcast-rs" }, # eco-system is transitioning from 1 to 2
+  { name = "float-cmp" },
+  { name = "gimli" }, # wasm-bindgen
+  { name = "hashbrown" }, # Old version used by polar-rs
+  { name = "itertools" }, # Too popular
+  { name = "kurbo" }, # Different versions in egui_extras/resvg and epaint/vello_cpu
+  { name = "libloading" }, # datafusion-ffi needs an older version than wgpu
+  { name = "linux-raw-sys" }, # because of two rustix versions.
+  { name = "lru" }, # because of lance
+  { name = "lz4_flex" }, # the Arrow ecosystem is a bit behind, but it's fine, this is a very tiny, flat dependency
+  { name = "memmap2" }, # because of walkers
+  { name = "nom" }, # lance
+  { name = "objc2-app-kit" }, # `accesskit_macos` uses a different version than `arboard`
+  { name = "objc2-foundation" }, # `accesskit_macos` uses a different version than `arboard`
+  { name = "objc2" }, # `accesskit_macos` uses a different version than `arboard`
+  { name = "ordered-float" }, # Old version being used by parquet, but super small!
+  { name = "quick-xml" }, # because of urdf-rs
+  { name = "redox_syscall" }, # Plenty of versions in the wild
+  { name = "rustc-hash" }, # numpy with compatible pyo3 requires different version than wgpu
+  { name = "rustix" }, # tantivy uses an old version.
+  { name = "unicode-width" }, # walkers depends on 0.1 via http-cache-request / cacache
+  { name = "ureq" }, # duplicated by `protoc-prebuilt`, which uses an outdated version.
+  { name = "zip" }, # duplicated by `protoc-prebuilt`, which uses an ancient version.
+]
+skip-tree = [
+  { name = "petgraph" }, # b/c lance
+  { name = "phf" }, # b/c mime_guess2
+  { name = "rand_distr" }, # from ndarray-rand
+  { name = "thiserror" }, # Waiting for eco-system to switch to 2.0
+  { name = "toml" }, # b/c cargo_metadata
+  { name = "webpki-roots" }, # need to update ureq
+  { name = "windows-sys" }, # Impossible
+  { name = "zerocopy" }, # Need to update re_rav1d
+  # NOTE: `skip-tree` skips the whole tree! Consider adding to just `skip` instead (scroll up!)
+]
+
+[licenses]
+version = 2
+private = { ignore = true }
+confidence-threshold = 0.93 # We want really high confidence when inferring licenses from text
+allow = [
+  "0BSD", # https://opensource.org/license/0bsd
+  "Apache-2.0 WITH LLVM-exception", # https://spdx.org/licenses/LLVM-exception.html
+  "Apache-2.0", # https://tldrlegal.com/license/apache-license-2.0-(apache-2.0)
+  "BSD-2-Clause", # https://tldrlegal.com/license/bsd-2-clause-license-(freebsd)
+  "BSD-3-Clause", # https://tldrlegal.com/license/bsd-3-clause-license-(revised)
+  "BSL-1.0", # https://tldrlegal.com/license/boost-software-license-1.0-explained
+  "CC0-1.0", # https://creativecommons.org/publicdomain/zero/1.0/
+  "CDLA-Permissive-2.0", # https://cdla.dev/permissive-2-0/
+  "ISC", # https://www.tldrlegal.com/license/isc-license
+  "MIT-0", # https://choosealicense.com/licenses/mit-0/
+  "MIT", # https://tldrlegal.com/license/mit-license
+  "MPL-2.0", # https://www.mozilla.org/en-US/MPL/2.0/FAQ/ - see Q11. Used by webpki-roots on Linux.
+  "OFL-1.1", # https://spdx.org/licenses/OFL-1.1.html
+  "Ubuntu-font-1.0", # https://ubuntu.com/legal/font-licence
+  "Unicode-3.0", # https://www.unicode.org/license.txt
+  "Zlib", # https://tldrlegal.com/license/zlib-libpng-license-(zlib)
+]
+exceptions = []
+
+[[licenses.clarify]]
+name = "webpki"
+expression = "ISC"
+license-files = [{ path = "LICENSE", hash = 0x001c7e6c }]
+
+[[licenses.clarify]]
+name = "ring"
+expression = "MIT AND ISC AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[sources.allow-org]
+github = ["emilk", "rerun-io"]

@@ -1,0 +1,106 @@
+.DS_Store
+__MACOSX
+
+# C++ and CMake stuff:
+*.a
+*.bin
+*.o
+/.ccls-cache/
+/arrow/
+/build/
+**/build-msvc/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/Makefile
+**/cmake_install.cmake
+_deps
+**/.cache/
+**/rerun_cpp/docs/html
+**/rerun_cpp/docs/xml
+*.tgz
+
+# User-specific VSCode C++ extension config:
+.vscode/c_cpp_properties.json
+
+# Rust compile target directories.
+# These should only be found in the repository root, so prefix them all with slashes:
+/target
+/target_pixi
+/target_pixi_wasm
+/target_ra
+/target_wasm
+
+# Python virtual environment:
+**/venv*
+**/.venv*
+/env/
+
+# Python build artifacts:
+__pycache__
+.mypy_cache
+*.pyc
+*.pyd
+*.so
+**/.ipynb_checkpoints/
+**/.pytest_cache
+
+# Pixi environment
+.pixi
+
+# Generated shims (created by ensure-rerun-env)
+scripts/pixi/uv
+scripts/pixi/uv.exe
+scripts/pixi/uvpy
+scripts/pixi/uvpy.exe
+
+.gdb_history
+perf.data*
+
+**/dataset/
+
+# insta snapshot temp file:
+*.pending-snap
+*.snap.new
+
+# Screenshots from samples etc.
+screenshot*.png
+
+# Saved example `.rrd` files
+example_data
+
+# Various builds
+dist
+wheels
+
+# VSCode local tasks
+.vscode/tasks.json
+
+# Screenshot comparison build
+/compare_screenshot
+**/tests/snapshots/**/*.diff.png
+**/tests/snapshots/**/*.new.png
+**/tests/snapshots/**/*.old.png
+
+# Mesa install
+mesa
+mesa.7z
+mesa.tar.xz
+icd.json
+
+# Temporary RRD files. Don't blanket ignore them since we check in some for backwards compatibility tests.
+docs/snippets/**/*.rrd
+
+/meilisearch
+
+.claude
+.pixi/*
+justfile
+
+# heaptrack files
+*.zst
+
+# Lychee link checker cache
+.lycheecache
+
+# Saved pytest-benchmark results
+/.benchmarks

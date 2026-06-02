@@ -1,0 +1,23 @@
+{
+  "extraPaths": [
+    "rerun_py/rerun_sdk",
+    "rerun_py/tests/api_sandbox"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "target*",
+    "venv*",
+    ".pixi",
+    "build"
+  ],
+  "ignore": [
+    "rerun_py/rerun"
+  ],
+  "defineConstant": {
+    "DEBUG": true
+  },
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportPrivateImportUsage": false
+}

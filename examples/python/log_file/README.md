@@ -1,0 +1,14 @@
+<!--[metadata]
+title = "Log file"
+tags = ["API example", "Loader"]
+thumbnail = "https://static.rerun.io/log_file/d86e525cce547cd2dde8e2d7619c01bd3bbc861a/480w.png"
+thumbnail_dimensions = [480, 480]
+-->
+
+Demonstrates how to log any file from the SDK using the [`Importer`](https://www.rerun.io/docs/concepts/logging-and-ingestion/importers/overview) machinery.
+
+Usage:
+```bash
+python examples/python/log_file/log_file.py examples/assets
+```
+

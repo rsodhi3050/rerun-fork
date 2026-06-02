@@ -1,0 +1,32 @@
+[package]
+name = "re_test_viewport"
+description = "A viewport used for tests"
+authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+license.workspace = true
+publish = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+re_log_types.workspace = true
+re_test_context.workspace = true
+re_sdk_types.workspace = true
+re_ui.workspace = true
+re_viewer_context.workspace = true
+re_viewport.workspace = true
+re_viewport_blueprint.workspace = true
+
+# External dependencies
+ahash.workspace = true
+egui.workspace = true
+
+[dev-dependencies]
+re_chunk.workspace = true
+re_entity_db.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "dataframe_query"
+version = "0.32.2"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+rerun = { path = "../../../crates/top/rerun", default-features = false, features = ["dataframe"] }
+
+itertools.workspace = true
+unindent.workspace = true
