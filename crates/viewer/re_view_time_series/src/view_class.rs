@@ -691,7 +691,7 @@ impl ViewClass for TimeSeriesView {
         // TODO(#5075): Boxed-zoom should be fixed to accommodate the locked range.
         let timestamp_format = ctx.app_options().timestamp_format;
 
-        // temple_ctrl fork: force a generous fixed y-axis floor so
+        // Hab fork: force a generous fixed y-axis floor so
         // every stacked TimeSeriesView has identical left margin and
         // the per-view time cursors land at the same screen X across
         // all panels.
@@ -734,7 +734,7 @@ impl ViewClass for TimeSeriesView {
                 .grid_fade(tokens.plot_grid_fade)
                 .auto_bounds(false)
                 .allow_zoom(!zoom_lock)
-                // temple_ctrl fork: when an axis has zoom_lock set,
+                // Hab fork: when an axis has zoom_lock set,
                 // also forbid DRAG-panning along that axis. egui_plot
                 // treats zoom and drag as independent — locking just
                 // zoom leaves users free to accidentally pan Y while
@@ -749,7 +749,7 @@ impl ViewClass for TimeSeriesView {
                     egui_plot::AxisHints::new_x()
                         .min_thickness(min_x_axis_thickness)
                         .formatter({
-                            // temple_ctrl fork: never let
+                            // Hab fork: never let
                             // format_compact emit a bare "2026-05-20"
                             // on midnight ticks — it showed up
                             // redundantly on every panel (since all
@@ -790,7 +790,7 @@ impl ViewClass for TimeSeriesView {
             // Sharing the same cursor is always nice:
             plot = plot.link_cursor(timeline.name().as_str(), [true; 2]);
 
-            // temple_ctrl fork: also link the X-axis viewport across
+            // Hab fork: also link the X-axis viewport across
             // every TimeSeriesView on the same timeline. Without this,
             // panning/zooming time on one plot leaves the others
             // behind — user-reported as "the scrolling time is per
@@ -958,7 +958,7 @@ impl ViewClass for TimeSeriesView {
 
                     // Write new y_range if it has changed.
                     //
-                    // temple_ctrl fork: gate this on zoom_lock.y. When
+                    // Hab fork: gate this on zoom_lock.y. When
                     // the user has explicitly locked the y-axis (via
                     // ScalarAxis.zoom_lock=true), we treat the
                     // blueprint range as authoritative — DO NOT save
@@ -1439,7 +1439,7 @@ fn paint_time_cursor(
         ]);
     }
 
-    // temple_ctrl fork: replace the bold scrubber-flag style (a 10×10
+    // Hab fork: replace the bold scrubber-flag style (a 10×10
     // downward-pointing triangle + 2-3 px stroke) with a thin, subtle
     // hairline. The global TimePanel scrubber at the bottom of the
     // viewport is now the primary control; each per-view cursor is

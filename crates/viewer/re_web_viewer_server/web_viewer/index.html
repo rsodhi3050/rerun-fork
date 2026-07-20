@@ -362,13 +362,13 @@
 
         function check_for_panic() {
           if (handle.has_panicked()) {
-            console.error("Temple Run has crashed");
+            console.error("Hab has crashed");
 
             document.getElementById("the_canvas_id").remove();
 
             show_center_html(`
               <p class="strong">
-                  Temple Run has crashed.
+                  Hab has crashed.
               </p>
               <pre align="left">${handle.panic_message()}</pre>
               <p>

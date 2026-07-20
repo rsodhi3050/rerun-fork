@@ -20,8 +20,8 @@
   "loop_selection_alpha_inactive": 0.20, // Multiplied with selection_bg_fill
 
   // ──────────────────────────────────────────────────────────────────────
-  // temple_run fork: Temple paper-white palette.
-  // Mirrors crates/temple-cli/src/theme.rs (BG_BASE #ffffff, BG_PANEL
+  // Hab fork: Hab paper-white palette.
+  // Mirrors crates/hab-cli/src/theme.rs (BG_BASE #ffffff, BG_PANEL
   // #fafafa, BG_ELEV #f5f5f7, TEXT_PRIMARY #111114, ACCENT #6d28d9).
   // Brand violet replaces upstream's blue accent; chrome (top/tab/bottom
   // bar, side panels) uses Gray.975 (#fafafa) instead of Gray.800-1000
@@ -117,7 +117,7 @@
       "color": "{Purple.850}"
     },
     "selection_stroke_color": {
-      // Temple brand violet ACCENT (#6d28d9, closest ramp = Purple.400).
+      // Hab brand violet ACCENT (#6d28d9, closest ramp = Purple.400).
       "color": "{Purple.400}"
     },
     "focus_outline_stroke": {
@@ -219,7 +219,7 @@
     "faint_bg_color": {
       "color": "{Gray.950}"
     },
-    // temple_ctrl fork: pushed grid one stop darker to better match
+    // Hab fork: pushed grid one stop darker to better match
     // the Playback SignalCanvas's grid stroke. Replace with
     // {Gray.850} (upstream default) to revert.
     "plot_grid_color": {

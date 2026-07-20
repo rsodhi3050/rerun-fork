@@ -207,7 +207,7 @@
     "faint_bg_color": {
       "color": "{Gray.900}"
     },
-    // temple_ctrl fork: pushed grid one stop darker to better match
+    // Hab fork: pushed grid one stop darker to better match
     // the Playback SignalCanvas's grid stroke. Replace with
     // {Gray.850} (upstream default) to revert.
     "plot_grid_color": {
