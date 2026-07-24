@@ -169,6 +169,7 @@ impl StreamSub {
 struct HabShell {
     rerun_app: re_viewer::App,
     blueprint_tx: re_log_channel::LogSender,
+    grpc_shutdown: re_grpc_server::shutdown::Signal,
     workspace: Workspace,
     playback_sub: PlaybackSub,
     stream_sub: StreamSub,
@@ -190,7 +191,11 @@ struct HabShell {
 }
 
 impl HabShell {
-    fn new(rerun_app: re_viewer::App, blueprint_tx: re_log_channel::LogSender) -> Self {
+    fn new(
+        rerun_app: re_viewer::App,
+        blueprint_tx: re_log_channel::LogSender,
+        grpc_shutdown: re_grpc_server::shutdown::Signal,
+    ) -> Self {
         let services = services::NativeServices::new();
         let pipeline = pipeline_ui::PipelineUi::load(
             services
@@ -202,6 +207,7 @@ impl HabShell {
         Self {
             rerun_app,
             blueprint_tx,
+            grpc_shutdown,
             workspace: Workspace::Pipeline,
             playback_sub: PlaybackSub::Sessions,
             stream_sub: StreamSub::Line,
@@ -221,6 +227,13 @@ impl HabShell {
             playback_texture: None,
             playback_texture_key: None,
         }
+    }
+
+    fn shutdown(&mut self) {
+        if let Err(error) = self.services.shutdown() {
+            re_log::warn!("HAB process shutdown was incomplete: {error}");
+        }
+        self.grpc_shutdown.stop();
     }
 
     fn recording_connected(&self) -> bool {
@@ -2602,6 +2615,12 @@ impl HabShell {
     }
 }
 
+impl Drop for HabShell {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 impl eframe::App for HabShell {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         self.rerun_app.clear_color(visuals)
@@ -2613,6 +2632,10 @@ impl eframe::App for HabShell {
 
     fn logic(&mut self, egui_ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.rerun_app.logic(egui_ctx, frame);
+    }
+
+    fn on_exit(&mut self) {
+        self.shutdown();
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -3853,10 +3876,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     re_log::setup_logging();
     re_crash_handler::install_crash_handlers(re_viewer::build_info());
 
+    let (grpc_shutdown, grpc_shutdown_request) = re_grpc_server::shutdown::shutdown();
     let grpc_rx = re_grpc_server::spawn_with_recv(
         "127.0.0.1:9876".parse()?,
         Default::default(),
-        re_grpc_server::shutdown::never(),
+        grpc_shutdown_request,
     );
     let (blueprint_tx, blueprint_rx) = re_log_channel::log_channel(re_log_channel::LogSource::Sdk);
 
@@ -3900,7 +3924,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rerun_app.add_log_receiver(grpc_rx);
             rerun_app.add_log_receiver(blueprint_rx);
 
-            Ok(Box::new(HabShell::new(rerun_app, blueprint_tx)))
+            Ok(Box::new(HabShell::new(
+                rerun_app,
+                blueprint_tx,
+                grpc_shutdown,
+            )))
         }),
     )?;
 

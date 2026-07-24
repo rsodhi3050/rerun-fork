@@ -198,6 +198,7 @@ pub struct NativeServices {
     pub busy: bool,
     last_probe: Instant,
     probe_pending: bool,
+    shutdown_started: bool,
 }
 
 impl Default for NativeServices {
@@ -251,11 +252,41 @@ impl NativeServices {
             busy: false,
             last_probe: Instant::now() - Duration::from_secs(10),
             probe_pending: false,
+            shutdown_started: false,
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Finalize active recording and stop the engine/device stack owned by this
+    /// HAB window. This is synchronous so native window teardown cannot race
+    /// process cleanup or leave camera and microphone capture running.
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        if self.shutdown_started {
+            return Ok(());
+        }
+        self.shutdown_started = true;
+
+        let mut errors = Vec::new();
+        if self.recording_path.is_some()
+            && let Err(error) =
+                set_parameter("rerun", "recording_path", Value::String(String::new()))
+        {
+            errors.push(format!("recording finalization failed: {error}"));
+        }
+        self.recording_path = None;
+
+        if let Err(error) = stop_owned_processes(&self.root) {
+            errors.push(error);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub fn poll(&mut self) -> Vec<String> {
@@ -524,6 +555,14 @@ impl NativeServices {
 
     pub fn clear_timeline(&mut self) {
         self.timeline_events.clear();
+    }
+}
+
+impl Drop for NativeServices {
+    fn drop(&mut self) {
+        if let Err(error) = self.shutdown() {
+            eprintln!("HAB shutdown warning: {error}");
+        }
     }
 }
 
@@ -1298,22 +1337,139 @@ fn process_is_running(pid: u32) -> bool {
 }
 
 fn stop_recorded_processes(root: &Path) -> Result<(), String> {
-    let run_state = root
+    let Some((run_state, value)) = read_run_state(root)? else {
+        return Ok(());
+    };
+    stop_processes_in_state(&value)?;
+    remove_run_state(&run_state)
+}
+
+fn stop_owned_processes(root: &Path) -> Result<(), String> {
+    let Some((run_state, value)) = read_run_state(root)? else {
+        return Ok(());
+    };
+    if value.get("viewer_pid").and_then(Value::as_u64) != Some(std::process::id() as u64) {
+        return Ok(());
+    }
+    stop_processes_in_state(&value)?;
+    remove_run_state(&run_state)
+}
+
+fn read_run_state(root: &Path) -> Result<Option<(PathBuf, Value)>, String> {
+    let path = root
         .join("artifacts")
         .join("inspector-live")
         .join("run.json");
-    if !run_state.is_file() {
-        return Ok(());
+    if !path.is_file() {
+        return Ok(None);
     }
-    let value: Value =
-        serde_json::from_str(&fs::read_to_string(&run_state).map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())?;
-    for key in ["device_pid", "engine_pid"] {
-        if let Some(pid) = value.get(key).and_then(Value::as_u64) {
-            stop_process(pid as u32);
+    let raw = fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let value = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
+    Ok(Some((path, value)))
+}
+
+fn remove_run_state(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove run state {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn stop_processes_in_state(value: &Value) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (key, sentinel, timeout) in [
+        (
+            "device_pid",
+            "hab_synthetic_device.shutdown",
+            Duration::from_secs(5),
+        ),
+        (
+            "engine_pid",
+            "hab_ctrl_engine.shutdown",
+            Duration::from_secs(10),
+        ),
+    ] {
+        let Some(pid) = value.get(key).and_then(Value::as_u64) else {
+            continue;
+        };
+        if let Err(error) = stop_process_gracefully(pid as u32, sentinel, timeout) {
+            errors.push(error);
         }
     }
-    Ok(())
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn stop_process_gracefully(
+    pid: u32,
+    sentinel_prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    if !process_is_running(pid) {
+        return Ok(());
+    }
+
+    let sentinel = std::env::temp_dir().join(format!("{sentinel_prefix}.{pid}"));
+    fs::write(&sentinel, b"shutdown").map_err(|error| {
+        format!(
+            "failed to request graceful shutdown for PID {pid} via {}: {error}",
+            sentinel.display()
+        )
+    })?;
+
+    let deadline = Instant::now() + timeout;
+    while process_is_running(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let _ = fs::remove_file(&sentinel);
+
+    if process_is_running(pid) {
+        stop_process(pid);
+        let force_deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_running(pid) && Instant::now() < force_deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    if process_is_running(pid) {
+        Err(format!("process PID {pid} did not stop"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_process_gracefully(
+    pid: u32,
+    _sentinel_prefix: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    if !process_is_running(pid) {
+        return Ok(());
+    }
+    stop_process(pid);
+    let deadline = Instant::now() + timeout;
+    while process_is_running(pid) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    if process_is_running(pid) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output();
+    }
+    if process_is_running(pid) {
+        Err(format!("process PID {pid} did not stop"))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "windows")]
