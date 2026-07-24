@@ -3214,7 +3214,15 @@ impl App {
     /// Initialize and advance the active recording time control while HAB is
     /// showing its own playback canvas instead of the full viewer UI.
     pub fn hab_prepare_playback(&mut self) {
-        self.move_time();
+        // `move_time` also applies the Rerun blueprint's default "follow" mode.
+        // HAB owns transport while its native canvas is visible, so ticking the
+        // Rerun controller every frame would immediately snap an explicit seek
+        // (including START) back to the recording end. Only use it to establish
+        // the active timeline/range; the HAB controls drive the cursor after
+        // that snapshot exists.
+        if self.hab_playback_snapshot().is_none() {
+            self.move_time();
+        }
     }
 
     /// Move the active recording's time cursor without exposing viewer internals
