@@ -353,6 +353,18 @@ impl From<crate::blueprint::TimeSeriesView> for ContainerLike {
     }
 }
 
+impl From<crate::blueprint::StateTimelineView> for ContainerLike {
+    fn from(view: crate::blueprint::StateTimelineView) -> Self {
+        Self::View(view.0)
+    }
+}
+
+impl From<crate::blueprint::TextLogView> for ContainerLike {
+    fn from(view: crate::blueprint::TextLogView) -> Self {
+        Self::View(view.0)
+    }
+}
+
 impl From<crate::blueprint::MapView> for ContainerLike {
     fn from(view: crate::blueprint::MapView) -> Self {
         Self::View(view.0)

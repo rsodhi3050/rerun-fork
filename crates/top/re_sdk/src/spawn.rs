@@ -101,7 +101,7 @@ impl SpawnOptions {
     /// Resolves the final listen address value.
     pub fn listen_addr(&self) -> std::net::SocketAddr {
         std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             self.port,
         )
     }
@@ -339,6 +339,11 @@ pub fn spawn(opts: &SpawnOptions) -> Result<u16, SpawnError> {
         .arg(format!("--port={port}"))
         .arg(format!("--memory-limit={memory_limit}"))
         .arg(format!("--server-memory-limit={server_memory_limit}"))
+        // Hab's external-device ingress belongs to hab_ctrl_engine's
+        // WebSocket server. The viewer transport is intentionally local-only:
+        // it avoids exposing the Rerun gRPC endpoint to the LAN and prevents
+        // Windows from prompting for a firewall exception on every dev build.
+        .arg("--bind=127.0.0.1")
         .arg("--expect-data-soon");
 
     if opts.hide_welcome_screen {

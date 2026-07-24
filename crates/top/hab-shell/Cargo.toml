@@ -1,0 +1,19 @@
+[package]
+name = "hab-shell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+base64.workspace = true
+mimalloc.workspace = true
+rerun = { workspace = true, features = [
+    "native_viewer",
+    "sdk",
+    "server",
+] }
+serde_json.workspace = true
+serde_yaml = "0.9"
+tungstenite = "0.30"

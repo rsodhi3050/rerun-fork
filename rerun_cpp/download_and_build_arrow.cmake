@@ -4,6 +4,18 @@
 # Tries to build an as small as possible version of Arrow that is compatible with the Rerun C++ SDK.
 function(download_and_build_arrow)
     include(ExternalProject)
+    if(NOT GIT_EXECUTABLE)
+        find_program(GIT_EXECUTABLE
+            NAMES git git.exe
+            HINTS
+                "C:/Program Files/Git/cmd"
+                "C:/Program Files/Git/bin"
+                "C:/Program Files (x86)/Git/cmd"
+        )
+    endif()
+    if(NOT GIT_EXECUTABLE)
+        message(FATAL_ERROR "Git is required to patch the bundled Arrow source")
+    endif()
 
     set(ARROW_DOWNLOAD_PATH ${CMAKE_CURRENT_BINARY_DIR}/arrow)
 
@@ -81,6 +93,17 @@ function(download_and_build_arrow)
         set(VERSION_PATCH "-DCMAKE_POLICY_VERSION_MINIMUM=${CMAKE_POLICY_VERSION_MINIMUM}")
     endif()
 
+    # A native Windows build must not inherit Hab's vcpkg toolchain here:
+    # Arrow's source archive contains an old, full-featured vcpkg manifest
+    # which pulls AWS/GRPC and defeats this minimal preset. Preserve the
+    # toolchain only for actual cross-compilation.
+    if(CMAKE_CROSSCOMPILING AND CMAKE_TOOLCHAIN_FILE)
+        set(ARROW_TOOLCHAIN_ARG
+            "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}")
+    else()
+        set(ARROW_TOOLCHAIN_ARG "")
+    endif()
+
     set(MIMALLOC_PATCH ${CMAKE_CURRENT_LIST_DIR}/patches/mimalloc_cmake4.patch)
 
     ExternalProject_Add(
@@ -93,7 +116,12 @@ function(download_and_build_arrow)
 
         # Apply patch after checkout but before configure
         # TODO(apache/arrow#45985): Arrow can't support CMake 4.0 yet
-        PATCH_COMMAND git apply --check ${MIMALLOC_PATCH} && git apply ${MIMALLOC_PATCH} || true
+        PATCH_COMMAND
+            ${CMAKE_COMMAND}
+            "-DGIT_EXECUTABLE=${GIT_EXECUTABLE}"
+            "-DPATCH_FILE=${MIMALLOC_PATCH}"
+            "-DSOURCE_DIR=<SOURCE_DIR>"
+            -P "${CMAKE_CURRENT_LIST_DIR}/apply_patch_if_needed.cmake"
 
         # LOG_X ON means that the output of the command will
         # be logged to a file _instead_ of printed to the console.
@@ -120,7 +148,7 @@ function(download_and_build_arrow)
         -Dxsimd_SOURCE=BUNDLED
         -DBOOST_SOURCE=BUNDLED
         -DARROW_BOOST_USE_SHARED=OFF
-        -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE} # Specify the toolchain file for cross-compilation (see https://github.com/rerun-io/rerun/issues/7445)
+        ${ARROW_TOOLCHAIN_ARG}
         ${VERSION_PATCH}
         SOURCE_SUBDIR cpp
         BUILD_BYPRODUCTS ${ARROW_LIBRARY_FILE} ${ARROW_BUNDLED_DEPENDENCIES_FILE}

@@ -706,9 +706,9 @@ impl<'a> egui_tiles::Behavior<ViewId> for TilesDelegate<'a, '_> {
         re_ui::design_tokens_of_visuals(&style.visuals).title_bar_height()
     }
 
-    /// Hab fork: widen the inter-tile gap from egui_tiles'
-    /// default 1 px to 8 px so stacked TimeSeriesView panels get
-    /// visible breathing room — closer to PlaybackTab's MUI Stack
+    /// Hab fork: widen the inter-tile gap from `egui_tiles`'
+    /// default 1 px to 8 px so stacked `TimeSeriesView` panels get
+    /// visible breathing room — closer to `PlaybackTab`'s MUI Stack
     /// gap of 8-12 px. The thin 1 px default made our 4-chart
     /// vertical stack feel cramped + made it hard to tell where
     /// one panel's plot area ended and the next began.

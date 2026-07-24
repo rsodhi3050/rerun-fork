@@ -9,7 +9,7 @@ use re_auth::credentials::CredentialsProvider as _;
 use re_build_info::CrateVersion;
 use re_byte_size::{MemUsageTree, MemUsageTreeCapture, NamedMemUsageTree};
 use re_capabilities::MainThreadToken;
-use re_chunk::TimelineName;
+use re_chunk::{LatestAtQuery, TimelineName};
 use re_data_source::{AuthErrorHandler, FileContents, LogDataSource};
 use re_entity_db::InstancePath;
 use re_entity_db::entity_db::EntityDb;
@@ -552,6 +552,20 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Open a local file without routing it through URL parsing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn open_file_path(&self, path: std::path::PathBuf) {
+        ViewerOpenUrl::FilePath(path).open(
+            &self.egui_ctx,
+            &OpenUrlOptions {
+                follow: false,
+                recording_open_behavior: RecordingOpenBehavior::OpenAndSelect,
+                show_loader: true,
+            },
+            &self.command_sender,
+        );
     }
 
     pub fn is_screenshotting(&self) -> bool {
@@ -3169,6 +3183,136 @@ impl App {
         let store_hub = self.store_hub.as_ref()?;
         let recording_id = self.active_recording_id()?;
         store_hub.entity_db(recording_id)
+    }
+
+    /// Lightweight recording state used by HAB's native playback canvas.
+    ///
+    /// HAB deliberately keeps the expert Rerun viewer available in a separate
+    /// subtab while presenting its normal review workflow with product-specific
+    /// controls. The returned tuple is `(timeline, min, max, current, entities)`.
+    pub fn hab_playback_snapshot(&self) -> Option<(String, i64, i64, i64, Vec<String>)> {
+        let store_hub = self.store_hub.as_ref()?;
+        let recording_id = self.active_recording_id()?;
+        let recording = store_hub.entity_db(recording_id)?;
+        let time_control = self.state.time_control(recording_id)?;
+        let timeline = *time_control.timeline_name();
+        let range = recording.time_range_for(&timeline)?;
+        let current = time_control.time_int().unwrap_or(range.min);
+        let entities = recording
+            .sorted_entity_paths()
+            .map(ToString::to_string)
+            .collect();
+        Some((
+            timeline.to_string(),
+            range.min.as_i64(),
+            range.max.as_i64(),
+            current.as_i64(),
+            entities,
+        ))
+    }
+
+    /// Initialize and advance the active recording time control while HAB is
+    /// showing its own playback canvas instead of the full viewer UI.
+    pub fn hab_prepare_playback(&mut self) {
+        self.move_time();
+    }
+
+    /// Move the active recording's time cursor without exposing viewer internals
+    /// to the HAB shell.
+    pub fn hab_seek_playback(&mut self, requested_time: i64) -> bool {
+        let Some(recording_id) = self.active_recording_id().cloned() else {
+            return false;
+        };
+        let Some(time_control) = self.state.time_control(&recording_id) else {
+            return false;
+        };
+        let timeline = *time_control.timeline_name();
+        let Some(range) = self
+            .store_hub
+            .as_ref()
+            .and_then(|hub| hub.entity_db(&recording_id))
+            .and_then(|recording| recording.time_range_for(&timeline))
+        else {
+            return false;
+        };
+        let clamped = requested_time.clamp(range.min.as_i64(), range.max.as_i64());
+        let Some(time_control) = self.state.time_controls.get_mut(&recording_id) else {
+            return false;
+        };
+        time_control.set_time_ad_hoc(clamped.into());
+        true
+    }
+
+    /// Decode the first raw U8 image at HAB's active playback cursor.
+    ///
+    /// Encoded video remains the expert viewer's responsibility; the common
+    /// camera path written by HAB's C++ Rerun sink uses raw RGB/BGR images.
+    pub fn hab_playback_image(&self) -> Option<(String, u32, u32, Vec<u8>)> {
+        use re_sdk_types::{
+            archetypes::Image,
+            components::{ImageBuffer, ImageFormat},
+            datatypes::{ChannelDatatype, ColorModel},
+        };
+
+        let recording = self.recording_db()?;
+        let recording_id = self.active_recording_id()?;
+        let time_control = self.state.time_control(recording_id)?;
+        let query = LatestAtQuery::new(*time_control.timeline_name(), time_control.time_int()?);
+        for entity_path in recording.sorted_entity_paths() {
+            let Some((_, buffer)) = recording.latest_at_component::<ImageBuffer>(
+                entity_path,
+                &query,
+                Image::descriptor_buffer().component,
+            ) else {
+                continue;
+            };
+            let Some((_, format)) = recording.latest_at_component::<ImageFormat>(
+                entity_path,
+                &query,
+                Image::descriptor_format().component,
+            ) else {
+                continue;
+            };
+            let format = format.0;
+            if format.pixel_format.is_some() || format.channel_datatype != Some(ChannelDatatype::U8)
+            {
+                continue;
+            }
+            let model = format.color_model?;
+            let source: &[u8] = buffer.0.0.as_ref();
+            let pixels = usize::try_from(format.width)
+                .ok()?
+                .saturating_mul(usize::try_from(format.height).ok()?);
+            let mut rgb = Vec::with_capacity(pixels.saturating_mul(3));
+            match model {
+                ColorModel::RGB if source.len() >= pixels * 3 => {
+                    rgb.extend_from_slice(&source[..pixels * 3]);
+                }
+                ColorModel::BGR if source.len() >= pixels * 3 => {
+                    for pixel in source[..pixels * 3].chunks_exact(3) {
+                        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+                    }
+                }
+                ColorModel::RGBA if source.len() >= pixels * 4 => {
+                    for pixel in source[..pixels * 4].chunks_exact(4) {
+                        rgb.extend_from_slice(&pixel[..3]);
+                    }
+                }
+                ColorModel::BGRA if source.len() >= pixels * 4 => {
+                    for pixel in source[..pixels * 4].chunks_exact(4) {
+                        rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+                    }
+                }
+                ColorModel::L if source.len() >= pixels => {
+                    for value in &source[..pixels] {
+                        rgb.extend_from_slice(&[*value, *value, *value]);
+                    }
+                }
+                _ => continue,
+            }
+            return Some((entity_path.to_string(), format.width, format.height, rgb));
+        }
+        None
     }
 
     // NOTE: Relying on `self` is dangerous, as this is called during a time where some internal

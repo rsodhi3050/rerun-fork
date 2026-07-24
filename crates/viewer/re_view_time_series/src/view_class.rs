@@ -15,7 +15,7 @@ use re_sdk_types::blueprint::components::{
 use re_sdk_types::components::{AggregationPolicy, Color, Range1D, Visible};
 use re_sdk_types::datatypes::TimeRange;
 use re_sdk_types::{ComponentBatch as _, ComponentIdentifier, View as _, ViewClassIdentifier};
-use re_ui::{Help, IconText, MouseButtonText, UiExt as _, icons, list_item};
+use re_ui::{Help, IconText, MouseButtonText, icons, list_item};
 use re_view::controls::{MOVE_TIME_CURSOR_BUTTON, SELECTION_RECT_ZOOM_BUTTON};
 use re_view::view_property_ui;
 use re_viewer_context::{
@@ -764,9 +764,7 @@ impl ViewClass for TimeSeriesView {
                             // in the parent app's chrome.
                             let no_date_format = match time_type {
                                 TimeType::TimestampNs => timestamp_format
-                                    .with_date_visibility(
-                                        re_log_types::DateVisibility::HideDate,
-                                    ),
+                                    .with_date_visibility(re_log_types::DateVisibility::HideDate),
                                 _ => timestamp_format,
                             };
                             move |time, _| {
@@ -1461,7 +1459,12 @@ fn paint_time_cursor(
         // user is not interacting with it — visible enough to find when
         // they want to grab it. Matches the "secondary chrome" feel of
         // SignalCanvas's hover line.
-        egui::Color32::from_rgba_unmultiplied(128, 128, 128, 102)
+        ui.visuals()
+            .widgets
+            .noninteractive
+            .fg_stroke
+            .color
+            .gamma_multiply(0.4)
     };
     let stroke = egui::Stroke {
         width: if highlighted { 1.5 } else { 1.0 },

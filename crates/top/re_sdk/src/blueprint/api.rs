@@ -157,6 +157,33 @@ impl Blueprint {
         Ok(msgs)
     }
 
+    /// Convert the blueprint and its activation command into viewer messages.
+    ///
+    /// This is useful for applications that embed the viewer and feed it through
+    /// an in-process [`re_log_channel::LogReceiver`] instead of creating a
+    /// second recording stream solely to carry blueprint state.
+    pub fn to_log_msgs_with_activation(
+        &self,
+        application_id: &str,
+        activation: BlueprintActivation,
+    ) -> RecordingStreamResult<Vec<LogMsg>> {
+        let mut msgs = self.to_log_msgs(application_id)?;
+        let blueprint_id = msgs
+            .first()
+            .map(|msg| msg.store_id().clone())
+            .expect("Blueprint should have at least one SetStoreInfo message");
+
+        msgs.push(
+            BlueprintActivationCommand {
+                blueprint_id,
+                make_active: activation.make_active,
+                make_default: activation.make_default,
+            }
+            .into(),
+        );
+        Ok(msgs)
+    }
+
     /// Send the blueprint to the given recording stream.
     pub fn send(
         &self,

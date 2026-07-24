@@ -9,7 +9,8 @@ pub use api::{Blueprint, BlueprintActivation, BlueprintOpts};
 pub use container::{ContainerLike, Grid, Horizontal, Tabs, Vertical};
 pub use panel::{BlueprintPanel, SelectionPanel, TimePanel};
 pub use view::{
-    GraphView, MapView, Spatial2DView, Spatial3DView, TextDocumentView, TimeSeriesView, View,
+    GraphView, MapView, Spatial2DView, Spatial3DView, StateTimelineView, TextDocumentView,
+    TextLogView, TimeSeriesView, View,
 };
 
 // Re-export types for working with visualizers and component mappings

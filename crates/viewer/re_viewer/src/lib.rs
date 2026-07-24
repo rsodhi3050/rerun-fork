@@ -64,6 +64,7 @@ mod loading;
 pub mod blueprint;
 
 pub use app::App;
+pub use app_blueprint::PanelStateOverrides;
 pub(crate) use app_state::AppState;
 pub use event::{SelectionChangeItem, ViewerEvent, ViewerEventKind};
 pub use re_capabilities::MainThreadToken;

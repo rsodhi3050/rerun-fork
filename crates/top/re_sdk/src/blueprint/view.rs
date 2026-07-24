@@ -222,6 +222,70 @@ impl TimeSeriesView {
     }
 }
 
+/// State timeline view for state transitions over time.
+pub struct StateTimelineView(pub(crate) View);
+
+impl StateTimelineView {
+    /// Create a new state timeline view.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(View {
+            class_identifier: "StateTimeline".into(),
+            name: Some(name.into()),
+            ..Default::default()
+        })
+    }
+
+    /// Set the origin entity path.
+    pub fn with_origin(mut self, origin: impl Into<EntityPath>) -> Self {
+        self.0.origin = origin.into();
+        self
+    }
+
+    /// Set the contents query expressions.
+    pub fn with_contents(mut self, queries: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.0.contents = queries.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set visibility.
+    pub fn with_visible(mut self, visible: bool) -> Self {
+        self.0.visible = Some(visible);
+        self
+    }
+}
+
+/// Text log view for timestamped event details.
+pub struct TextLogView(pub(crate) View);
+
+impl TextLogView {
+    /// Create a new text log view.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(View {
+            class_identifier: "TextLog".into(),
+            name: Some(name.into()),
+            ..Default::default()
+        })
+    }
+
+    /// Set the origin entity path.
+    pub fn with_origin(mut self, origin: impl Into<EntityPath>) -> Self {
+        self.0.origin = origin.into();
+        self
+    }
+
+    /// Set the contents query expressions.
+    pub fn with_contents(mut self, queries: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.0.contents = queries.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Set visibility.
+    pub fn with_visible(mut self, visible: bool) -> Self {
+        self.0.visible = Some(visible);
+        self
+    }
+}
+
 /// Spatial 2D view.
 pub struct Spatial2DView(pub(crate) View);
 
