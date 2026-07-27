@@ -6,8 +6,9 @@
 //! process work runs on a worker thread so a slow device can never stall egui.
 
 use std::{
-    collections::VecDeque,
+    collections::{VecDeque, hash_map::DefaultHasher},
     fs,
+    hash::{Hash as _, Hasher as _},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -56,6 +57,8 @@ pub struct ConfigInfo {
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
     pub path: PathBuf,
+    pub rrd_path: Option<PathBuf>,
+    pub hdf5_path: Option<PathBuf>,
     pub name: String,
     pub study: String,
     pub participant: String,
@@ -64,6 +67,12 @@ pub struct SessionInfo {
     pub modified: Option<SystemTime>,
     pub artifacts: Vec<String>,
     pub annotation_preview: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PreparedPlayback {
+    pub source_path: PathBuf,
+    pub rrd_path: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -149,6 +158,7 @@ enum WorkerCommand {
     },
     StartRecording(PathBuf),
     StopRecording,
+    PrepareHdf5Playback(PathBuf),
     RunConfig(PathBuf),
     StopEngine,
     StartSyntheticDevice,
@@ -159,6 +169,7 @@ enum WorkerEvent {
     ActionFinished(Result<String, String>),
     RecordingStarted(Result<PathBuf, String>),
     RecordingStopped(Result<String, String>),
+    Hdf5PlaybackPrepared(Result<PreparedPlayback, String>),
     ConfigStarted(Result<PathBuf, String>),
     EngineStopped(Result<String, String>),
 }
@@ -195,6 +206,7 @@ pub struct NativeServices {
     pub audio_channels: u16,
     pub audio_source: String,
     pub audio_sample_format: String,
+    prepared_playback: Option<PreparedPlayback>,
     pub busy: bool,
     last_probe: Instant,
     probe_pending: bool,
@@ -249,6 +261,7 @@ impl NativeServices {
             audio_channels: 0,
             audio_source: "waiting".to_owned(),
             audio_sample_format: String::new(),
+            prepared_playback: None,
             busy: false,
             last_probe: Instant::now() - Duration::from_secs(10),
             probe_pending: false,
@@ -315,7 +328,11 @@ impl NativeServices {
                     match result {
                         Ok(path) => {
                             self.recording_path = Some(path.clone());
-                            notices.push(format!("Recording to {}", path.display()));
+                            notices.push(format!(
+                                "Recording synchronized {} + {}",
+                                path.display(),
+                                path.with_extension("h5").display()
+                            ));
                         }
                         Err(error) => notices.push(format!("Recording failed: {error}")),
                     }
@@ -328,6 +345,21 @@ impl NativeServices {
                     notices.push(
                         result.unwrap_or_else(|error| format!("Stop recording failed: {error}")),
                     );
+                }
+                WorkerEvent::Hdf5PlaybackPrepared(result) => {
+                    self.busy = false;
+                    match result {
+                        Ok(prepared) => {
+                            notices.push(format!(
+                                "Validated HDF5 and prepared {}",
+                                prepared.rrd_path.display()
+                            ));
+                            self.prepared_playback = Some(prepared);
+                        }
+                        Err(error) => {
+                            notices.push(format!("HDF5 playback failed: {error}"));
+                        }
+                    }
                 }
                 WorkerEvent::ConfigStarted(result) => {
                     self.busy = false;
@@ -455,6 +487,39 @@ impl NativeServices {
         self.sessions
             .get(self.selected_session)
             .map(|session| session.path.as_path())
+    }
+
+    pub fn selected_rrd_path(&self) -> Option<&Path> {
+        self.sessions
+            .get(self.selected_session)
+            .and_then(|session| session.rrd_path.as_deref())
+    }
+
+    pub fn selected_hdf5_path(&self) -> Option<&Path> {
+        self.sessions
+            .get(self.selected_session)
+            .and_then(|session| session.hdf5_path.as_deref())
+    }
+
+    pub fn prepare_hdf5_playback(&mut self) {
+        if self.busy {
+            return;
+        }
+        let Some(path) = self.selected_hdf5_path().map(Path::to_owned) else {
+            return;
+        };
+        self.busy = true;
+        if self
+            .command_tx
+            .send(WorkerCommand::PrepareHdf5Playback(path))
+            .is_err()
+        {
+            self.busy = false;
+        }
+    }
+
+    pub fn take_prepared_playback(&mut self) -> Option<PreparedPlayback> {
+        self.prepared_playback.take()
     }
 
     pub fn set_parameter(
@@ -1066,8 +1131,11 @@ fn worker_loop(
             }
             WorkerCommand::StopRecording => WorkerEvent::RecordingStopped(
                 set_parameter("rerun", "recording_path", Value::String(String::new()))
-                    .map(|()| "Recording finalized and indexed".to_owned()),
+                    .map(|()| "RRD + HDF5 recording finalized and indexed".to_owned()),
             ),
+            WorkerCommand::PrepareHdf5Playback(path) => {
+                WorkerEvent::Hdf5PlaybackPrepared(prepare_hdf5_playback(&root, &path))
+            }
             WorkerCommand::RunConfig(path) => {
                 WorkerEvent::ConfigStarted(restart_stack(&root, &path).map(|()| path))
             }
@@ -1144,6 +1212,100 @@ fn start_recording(path: &Path) -> Result<(), String> {
         "recording_path",
         Value::String(path.to_string_lossy().into_owned()),
     )
+}
+
+fn prepare_hdf5_playback(root: &Path, source_path: &Path) -> Result<PreparedPlayback, String> {
+    if !source_path.is_file() {
+        return Err(format!("HDF5 session missing: {}", source_path.display()));
+    }
+    let script = root.join("scripts").join("hab_hdf5_to_rrd.py");
+    if !script.is_file() {
+        return Err(format!(
+            "HDF5 playback adapter missing: {}",
+            script.display()
+        ));
+    }
+    let modified = fs::metadata(source_path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH);
+    let adapter_modified = fs::metadata(&script)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH);
+    let mut hasher = DefaultHasher::new();
+    source_path.hash(&mut hasher);
+    modified.hash(&mut hasher);
+    adapter_modified.hash(&mut hasher);
+    let cache_key = hasher.finish();
+    let output_path = root
+        .join("data")
+        .join("playback_cache")
+        .join(format!("{cache_key:016x}.hdf5-review.rrd"));
+    if output_path.is_file() && fs::metadata(&output_path).is_ok_and(|metadata| metadata.len() > 0)
+    {
+        return Ok(PreparedPlayback {
+            source_path: source_path.to_owned(),
+            rrd_path: output_path,
+        });
+    }
+    let _ = fs::remove_file(&output_path);
+    let partial_path = output_path.with_extension("rrd.partial");
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let _ = fs::remove_file(&partial_path);
+    let python = if let Ok(explicit) = std::env::var("HAB_PYTHON") {
+        PathBuf::from(explicit)
+    } else if cfg!(target_os = "windows") {
+        root.join(".venv").join("Scripts").join("python.exe")
+    } else {
+        root.join(".venv").join("bin").join("python")
+    };
+    let mut command = Command::new(&python);
+    command
+        .current_dir(root)
+        .arg(&script)
+        .arg("--h5")
+        .arg(source_path)
+        .arg("--out")
+        .arg(&partial_path)
+        .arg("--app-id")
+        .arg("hab");
+    hide_window(&mut command);
+    let output = command.output().map_err(|error| {
+        format!(
+            "failed to start {} for HDF5 playback: {error}",
+            python.display()
+        )
+    })?;
+    if !output.status.success() {
+        let _ = fs::remove_file(&partial_path);
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("HDF5 adapter exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    if !partial_path.is_file()
+        || fs::metadata(&partial_path).map_or(true, |metadata| metadata.len() == 0)
+    {
+        let _ = fs::remove_file(&partial_path);
+        return Err(format!(
+            "HDF5 adapter produced no RRD: {}",
+            partial_path.display()
+        ));
+    }
+    fs::rename(&partial_path, &output_path).map_err(|error| {
+        let _ = fs::remove_file(&partial_path);
+        format!(
+            "failed to publish HDF5 playback cache {}: {error}",
+            output_path.display()
+        )
+    })?;
+    Ok(PreparedPlayback {
+        source_path: source_path.to_owned(),
+        rrd_path: output_path,
+    })
 }
 
 fn ws_request(kind: Value) -> Result<Value, String> {
@@ -1616,56 +1778,84 @@ fn collect_sessions(directory: &Path, sessions: &mut Vec<SessionInfo>, depth: us
     let Ok(entries) = fs::read_dir(directory) else {
         return;
     };
-    for entry in entries.flatten() {
+    let entries = entries.flatten().collect::<Vec<_>>();
+    let mut rrd_paths = Vec::new();
+    let mut hdf5_paths = Vec::new();
+    let mut child_directories = Vec::new();
+    let mut artifacts = Vec::new();
+    for entry in &entries {
         let path = entry.path();
         if path.is_dir() {
-            collect_sessions(&path, sessions, depth + 1);
+            child_directories.push(path);
             continue;
         }
+        if !path.is_file() {
+            continue;
+        }
+        artifacts.push(entry.file_name().to_string_lossy().into_owned());
         let extension = path
             .extension()
             .map(|value| value.to_string_lossy().to_ascii_lowercase());
-        let format = match extension.as_deref() {
-            Some("rrd") => "Rerun",
-            Some("h5") => "HDF5",
-            _ => continue,
+        match extension.as_deref() {
+            Some("rrd") => rrd_paths.push(path),
+            Some("h5" | "hdf5") => hdf5_paths.push(path),
+            _ => {}
+        }
+    }
+
+    if !rrd_paths.is_empty() || !hdf5_paths.is_empty() {
+        rrd_paths.sort();
+        hdf5_paths.sort();
+        let preferred = |paths: &[PathBuf], name: &str| {
+            paths
+                .iter()
+                .find(|path| path.file_name().is_some_and(|value| value == name))
+                .cloned()
+                .or_else(|| paths.first().cloned())
         };
-        let Ok(metadata) = entry.metadata() else {
-            continue;
+        let rrd_path = preferred(&rrd_paths, "session.rrd");
+        let hdf5_path = preferred(&hdf5_paths, "session.h5");
+        let path = rrd_path
+            .as_ref()
+            .or(hdf5_path.as_ref())
+            .expect("session has at least one representation")
+            .clone();
+        let format = match (rrd_path.is_some(), hdf5_path.is_some()) {
+            (true, true) => "RRD + HDF5",
+            (true, false) => "RRD",
+            (false, true) => "HDF5",
+            (false, false) => unreachable!(),
         };
-        let name = path
-            .parent()
-            .and_then(Path::file_name)
+        let name = directory
+            .file_name()
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        let session_directory = path.parent().unwrap_or(directory);
-        let participant = session_directory
+        let participant = directory
             .parent()
             .and_then(Path::file_name)
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "local".to_owned());
-        let study = session_directory
+        let study = directory
             .parent()
             .and_then(Path::parent)
             .and_then(Path::file_name)
             .map(|value| value.to_string_lossy().into_owned())
             .unwrap_or_else(|| "unassigned".to_owned());
-        let mut artifacts = fs::read_dir(session_directory)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter_map(|artifact| {
-                artifact
-                    .path()
-                    .is_file()
-                    .then(|| artifact.file_name().to_string_lossy().into_owned())
-            })
+        let representation_metadata = rrd_paths
+            .iter()
+            .chain(&hdf5_paths)
+            .filter_map(|path| fs::metadata(path).ok())
             .collect::<Vec<_>>();
+        let size_bytes = representation_metadata.iter().map(fs::Metadata::len).sum();
+        let modified = representation_metadata
+            .iter()
+            .filter_map(|metadata| metadata.modified().ok())
+            .max();
         artifacts.sort();
         let annotation_preview = ["annotations.csv", "annotation.csv", "events.csv"]
             .iter()
             .find_map(|name| {
-                let annotation_path = session_directory.join(name);
+                let annotation_path = directory.join(name);
                 fs::read_to_string(annotation_path).ok().map(|raw| {
                     raw.lines()
                         .filter(|line| !line.trim().is_empty())
@@ -1677,15 +1867,21 @@ fn collect_sessions(directory: &Path, sessions: &mut Vec<SessionInfo>, depth: us
             .unwrap_or_default();
         sessions.push(SessionInfo {
             path,
+            rrd_path,
+            hdf5_path,
             name,
             study,
             participant,
             format,
-            size_bytes: metadata.len(),
-            modified: metadata.modified().ok(),
+            size_bytes,
+            modified,
             artifacts,
             annotation_preview,
         });
+    }
+
+    for child in child_directories {
+        collect_sessions(&child, sessions, depth + 1);
     }
 }
 
@@ -1776,6 +1972,42 @@ mod tests {
             pipeline_name_from_yaml("version: 2\nmodule:\n  name: inspector_live\n"),
             Some("inspector_live".to_owned())
         );
+    }
+
+    #[test]
+    fn groups_rrd_and_hdf5_as_one_session() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "hab-shell-session-index-{}-{nonce}",
+            std::process::id()
+        ));
+        let session = root
+            .join("data")
+            .join("study_sessions")
+            .join("inspector_live")
+            .join("local")
+            .join("session-test");
+        fs::create_dir_all(&session).expect("test session directory");
+        fs::write(session.join("session.rrd"), b"rrd").expect("test RRD");
+        fs::write(session.join("session.h5"), b"hdf5").expect("test HDF5");
+
+        let sessions = discover_sessions(&root);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].format, "RRD + HDF5");
+        assert_eq!(
+            sessions[0].rrd_path.as_deref(),
+            Some(session.join("session.rrd").as_path())
+        );
+        assert_eq!(
+            sessions[0].hdf5_path.as_deref(),
+            Some(session.join("session.h5").as_path())
+        );
+        assert_eq!(sessions[0].size_bytes, 7);
+
+        fs::remove_dir_all(&root).expect("remove isolated test directory");
     }
 
     #[test]

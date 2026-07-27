@@ -1282,10 +1282,13 @@ impl HabShell {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
-                            let subtitle = selected_session.as_ref().map_or_else(
-                                || "Loading the selected RRD recording.".to_owned(),
-                                |session| session.path.to_string_lossy().into_owned(),
-                            );
+                            let subtitle = self
+                                .playback_loaded_path
+                                .as_ref()
+                                .map_or_else(
+                                    || "Loading the selected recording.".to_owned(),
+                                    |path| path.to_string_lossy().into_owned(),
+                                );
                             page_title(
                                 ui,
                                 "Playback Canvas",
@@ -1564,6 +1567,7 @@ impl HabShell {
         let sessions = self.services.sessions.clone();
         let mut review_selected = false;
         let mut expert_selected = false;
+        let mut review_hdf5 = false;
         let mut refresh = false;
 
         egui::CentralPanel::default()
@@ -1718,11 +1722,18 @@ impl HabShell {
                             }
                             ui.add_space(18.0);
                             ui.horizontal(|ui| {
-                                if dark_button(ui, "REVIEW ON CANVAS").clicked() {
-                                    review_selected = true;
+                                if session.rrd_path.is_some() {
+                                    if dark_button(ui, "REVIEW RRD").clicked() {
+                                        review_selected = true;
+                                    }
+                                    if outline_button(ui, "RRD EXPERT").clicked() {
+                                        expert_selected = true;
+                                    }
                                 }
-                                if outline_button(ui, "OPEN EXPERT RERUN").clicked() {
-                                    expert_selected = true;
+                                if session.hdf5_path.is_some()
+                                    && outline_button(ui, "VALIDATE + REVIEW HDF5").clicked()
+                                {
+                                    review_hdf5 = true;
                                 }
                             });
                         });
@@ -1734,10 +1745,14 @@ impl HabShell {
             let message = self.services.refresh_sessions();
             self.show_stub_notice(message);
         }
+        if review_hdf5 {
+            self.services.prepare_hdf5_playback();
+            self.show_stub_notice("Validating HDF5 streams and preparing HAB playback");
+        }
         if review_selected || expert_selected {
-            let path = self.services.selected_session_path().map(Path::to_owned);
+            let path = self.services.selected_rrd_path().map(Path::to_owned);
             match path {
-                Some(path) if path.extension().is_some_and(|extension| extension == "rrd") => {
+                Some(path) => {
                     self.rerun_app.open_file_path(path.clone());
                     self.playback_loaded_path = Some(path.clone());
                     self.playback_playing = false;
@@ -1752,11 +1767,7 @@ impl HabShell {
                     self.pending_blueprint = expert_selected;
                     self.show_stub_notice(format!("Opening {}", path.display()));
                 }
-                Some(path) => self.show_stub_notice(format!(
-                    "{} is HDF5; RRD review support is available now and HDF5 replay remains on the C++ replay path",
-                    path.display()
-                )),
-                None => self.show_stub_notice("Select a recorded session first"),
+                None => self.show_stub_notice("Selected session has no RRD representation"),
             }
         }
     }
@@ -2652,6 +2663,16 @@ impl eframe::App for HabShell {
         ));
         for notice in self.services.poll() {
             self.show_stub_notice(notice);
+        }
+        if let Some(prepared) = self.services.take_prepared_playback() {
+            self.rerun_app.open_file_path(prepared.rrd_path);
+            self.playback_loaded_path = Some(prepared.source_path);
+            self.playback_playing = false;
+            self.playback_last_tick = Instant::now();
+            self.playback_texture = None;
+            self.playback_texture_key = None;
+            self.playback_sub = PlaybackSub::Canvas;
+            self.pending_blueprint = false;
         }
         self.services.maybe_probe();
         self.masthead(ui);
