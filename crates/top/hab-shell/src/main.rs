@@ -3853,6 +3853,41 @@ fn timeline_event_card(ui: &mut egui::Ui, event: &services::TimelineEvent) {
                                     .color(TERTIARY),
                             );
                         }
+                        if !event.model_name.is_empty() {
+                            let model = if event.model_version.is_empty() {
+                                event.model_name.clone()
+                            } else {
+                                format!("{}@{}", event.model_name, event.model_version)
+                            };
+                            outlined_chip(ui, &model);
+                        }
+                        if !event.model_backend.is_empty() {
+                            let execution = if event.model_runtime.is_empty() {
+                                event.model_backend.clone()
+                            } else {
+                                format!("{} · {}", event.model_runtime, event.model_backend)
+                            };
+                            ui.label(
+                                egui::RichText::new(execution)
+                                    .size(9.0)
+                                    .monospace()
+                                    .color(TERTIARY),
+                            );
+                        }
+                        if !event.model_name.is_empty()
+                            || !event.model_backend.is_empty()
+                            || !event.model_runtime.is_empty()
+                        {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{:.2} ms",
+                                    event.inference_latency_ms
+                                ))
+                                .size(9.0)
+                                .monospace()
+                                .color(TERTIARY),
+                            );
+                        }
                     });
                 });
             });

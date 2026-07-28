@@ -85,6 +85,11 @@ pub struct TimelineEvent {
     pub label: String,
     pub confidence: f32,
     pub node: String,
+    pub model_name: String,
+    pub model_version: String,
+    pub model_backend: String,
+    pub model_runtime: String,
+    pub inference_latency_ms: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -1106,6 +1111,35 @@ fn parse_timeline_event(stream: &str, sample: &Value) -> Option<TimelineEvent> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_owned(),
+        model_name: data
+            .get("model_name")
+            .or_else(|| data.pointer("/model/name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model_version: data
+            .get("model_version")
+            .or_else(|| data.pointer("/model/version"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model_backend: data
+            .get("model_backend")
+            .or_else(|| data.pointer("/model/backend"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model_runtime: data
+            .get("model_runtime")
+            .or_else(|| data.pointer("/model/runtime"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        inference_latency_ms: data
+            .get("inference_latency_ms")
+            .or_else(|| data.pointer("/model/latency_ms"))
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
     })
 }
 
@@ -2025,6 +2059,13 @@ mod tests {
                     "label": "object",
                     "confidence": 0.82,
                     "node": "grasp_detector",
+                    "model": {
+                        "name": "grasp_v4",
+                        "version": "4.1.0",
+                        "backend": "cpp_hook",
+                        "runtime": "native_cpp",
+                        "latency_ms": 3.25
+                    },
                     "media": {"payload_base64": "discarded"}
                 }
             }),
@@ -2034,6 +2075,11 @@ mod tests {
         assert_eq!(event.title, "Grasp detected");
         assert_eq!(event.clock_time(), "00:00:42.500");
         assert!((event.confidence - 0.82).abs() < f32::EPSILON);
+        assert_eq!(event.model_name, "grasp_v4");
+        assert_eq!(event.model_version, "4.1.0");
+        assert_eq!(event.model_backend, "cpp_hook");
+        assert_eq!(event.model_runtime, "native_cpp");
+        assert!((event.inference_latency_ms - 3.25).abs() < f64::EPSILON);
     }
 
     #[test]
