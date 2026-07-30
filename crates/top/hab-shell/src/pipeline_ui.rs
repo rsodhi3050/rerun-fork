@@ -678,8 +678,8 @@ mod tests {
                 .join("inspector_live.yaml"),
         );
         assert!(graph.error.is_none(), "{:?}", graph.error);
-        assert_eq!(graph.nodes.len(), 8);
-        assert_eq!(graph.edges.len(), 12);
+        assert_eq!(graph.nodes.len(), 9);
+        assert_eq!(graph.edges.len(), 16);
         assert_eq!(
             graph
                 .nodes
