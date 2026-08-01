@@ -23,11 +23,31 @@ use tungstenite::{Message, connect};
 
 const ENGINE_ENDPOINT: &str = "ws://127.0.0.1:9999";
 const ENGINE_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9999);
-const TIMELINE_STREAMS: [&str; 4] = [
+// Hybrid Python events return through EventHub aliases while native-only
+// graphs expose transform outputs directly. Listen to both and de-duplicate
+// by the stable event id.
+const TIMELINE_STREAMS: [&str; 8] = [
     "grasp_detector.events",
     "scene_classifier.events",
     "speech_detector.events",
     "wake_detector.events",
+    "grasp",
+    "scene",
+    "speech",
+    "wake",
+];
+// The canonical hybrid graph republishes statuses through friendly EventHub
+// aliases; the all-C++ fallback exposes the native transform outputs directly.
+// Subscribe to both and de-duplicate by node so either graph remains visible.
+const MODEL_STATUS_STREAMS: [&str; 8] = [
+    "grasp_detector.status",
+    "scene_classifier.status",
+    "speech_detector.status",
+    "wake_detector.status",
+    "grasp_status",
+    "scene_status",
+    "speech_status",
+    "wake_status",
 ];
 const CAMERA_STREAM: &str = "camera_pipeline.frame";
 const AUDIO_STREAM: &str = "audio_pipeline.audio";
@@ -90,6 +110,31 @@ pub struct TimelineEvent {
     pub model_backend: String,
     pub model_runtime: String,
     pub inference_latency_ms: f64,
+    pub source_stream_id: String,
+    pub source_sequence: u64,
+    pub media_kind: String,
+    pub thumbnail: Option<EventThumbnail>,
+}
+
+#[derive(Clone, Debug)]
+pub struct EventThumbnail {
+    pub width: usize,
+    pub height: usize,
+    pub rgb: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelStatus {
+    pub node: String,
+    pub event_type: String,
+    pub state: String,
+    pub model_name: String,
+    pub model_version: String,
+    pub model_backend: String,
+    pub model_runtime: String,
+    pub warmup_latency_ms: f64,
+    pub timestamp_ns: i64,
+    pub error: String,
 }
 
 #[derive(Clone, Debug)]
@@ -154,6 +199,19 @@ impl TimelineEvent {
     }
 }
 
+impl ModelStatus {
+    pub fn clock_time(&self) -> String {
+        let seconds = self.timestamp_ns.max(0) as u64 / 1_000_000_000;
+        let seconds_in_day = seconds % 86_400;
+        format!(
+            "{:02}:{:02}:{:02}",
+            seconds_in_day / 3_600,
+            (seconds_in_day / 60) % 60,
+            seconds_in_day % 60,
+        )
+    }
+}
+
 enum WorkerCommand {
     Probe,
     SetParameter {
@@ -185,6 +243,7 @@ enum TimelineListenerEvent {
     Metrics(PipelineMetrics),
     Camera(CameraFrame),
     Audio(AudioFrame),
+    ModelStatus(ModelStatus),
 }
 
 pub struct NativeServices {
@@ -199,6 +258,7 @@ pub struct NativeServices {
     pub selected_session: usize,
     pub recording_path: Option<PathBuf>,
     pub timeline_events: VecDeque<TimelineEvent>,
+    pub model_statuses: Vec<ModelStatus>,
     pub timeline_connected: bool,
     pub timeline_error: Option<String>,
     pub pipeline_metrics: Option<PipelineMetrics>,
@@ -254,6 +314,7 @@ impl NativeServices {
             selected_session: 0,
             recording_path: None,
             timeline_events: VecDeque::with_capacity(MAX_TIMELINE_EVENTS),
+            model_statuses: Vec::with_capacity(MODEL_STATUS_STREAMS.len()),
             timeline_connected: false,
             timeline_error: None,
             pipeline_metrics: None,
@@ -406,8 +467,8 @@ impl NativeServices {
                     self.timeline_error = None;
                     if self
                         .timeline_events
-                        .front()
-                        .is_some_and(|existing| existing.id == event.id)
+                        .iter()
+                        .any(|existing| existing.id == event.id)
                     {
                         continue;
                     }
@@ -431,6 +492,19 @@ impl NativeServices {
                     self.audio_levels.extend(frame.levels);
                     while self.audio_levels.len() > MAX_AUDIO_LEVELS {
                         self.audio_levels.pop_front();
+                    }
+                }
+                TimelineListenerEvent::ModelStatus(status) => {
+                    if let Some(existing) = self
+                        .model_statuses
+                        .iter_mut()
+                        .find(|existing| existing.node == status.node)
+                    {
+                        *existing = status;
+                    } else {
+                        self.model_statuses.push(status);
+                        self.model_statuses
+                            .sort_by(|left, right| left.node.cmp(&right.node));
                     }
                 }
             }
@@ -665,6 +739,25 @@ fn timeline_listener_loop(event_tx: mpsc::Sender<TimelineListenerEvent>) {
                     }
                 }
                 if subscribe_failed.is_none() {
+                    for (index, stream) in MODEL_STATUS_STREAMS.iter().enumerate() {
+                        let payload = json!({
+                            "api_version": "0.12",
+                            "api_request": {
+                                "request_id": format!("hab-model-status-{index}"),
+                                "start_stream_request": {
+                                    "stream_id": format!("hab-model-status-{index}"),
+                                    "app_id": "hab-shell",
+                                    (*stream): {}
+                                }
+                            }
+                        });
+                        if let Err(error) = socket.send(Message::Text(payload.to_string().into())) {
+                            subscribe_failed = Some(error.to_string());
+                            break;
+                        }
+                    }
+                }
+                if subscribe_failed.is_none() {
                     let payload = json!({
                         "api_version": "0.12",
                         "api_request": {
@@ -776,6 +869,24 @@ fn timeline_listener_loop(event_tx: mpsc::Sender<TimelineListenerEvent>) {
                                     if let Some(event) = parse_timeline_event(stream, sample)
                                         && event_tx
                                             .send(TimelineListenerEvent::Event(event))
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            for stream in MODEL_STATUS_STREAMS {
+                                let Some(samples) = batches
+                                    .get(stream)
+                                    .and_then(|batch| batch.get("samples"))
+                                    .and_then(Value::as_array)
+                                else {
+                                    continue;
+                                };
+                                for sample in samples {
+                                    if let Some(status) = parse_model_status(sample)
+                                        && event_tx
+                                            .send(TimelineListenerEvent::ModelStatus(status))
                                             .is_err()
                                     {
                                         return;
@@ -1140,6 +1251,128 @@ fn parse_timeline_event(stream: &str, sample: &Value) -> Option<TimelineEvent> {
             .or_else(|| data.pointer("/model/latency_ms"))
             .and_then(Value::as_f64)
             .unwrap_or_default(),
+        source_stream_id: data
+            .get("source_stream_id")
+            .or_else(|| data.pointer("/evidence/source_stream_id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        source_sequence: data
+            .get("source_sequence")
+            .or_else(|| data.pointer("/evidence/source_sequence"))
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        media_kind: data
+            .pointer("/evidence/media_kind")
+            .or_else(|| data.pointer("/media/kind"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        thumbnail: parse_event_thumbnail(&data),
+    })
+}
+
+fn parse_event_thumbnail(data: &Value) -> Option<EventThumbnail> {
+    let media = data.get("media")?;
+    if media.get("kind").and_then(Value::as_str) != Some("image") {
+        return None;
+    }
+    let metadata = media.get("metadata")?;
+    let width = usize::try_from(metadata.get("width")?.as_u64()?).ok()?;
+    let height = usize::try_from(metadata.get("height")?.as_u64()?).ok()?;
+    let channels = usize::try_from(
+        metadata
+            .get("channels")
+            .and_then(Value::as_u64)
+            .unwrap_or(3),
+    )
+    .ok()?;
+    if width == 0 || height == 0 || width > 4096 || height > 4096 || channels < 3 {
+        return None;
+    }
+    let bytes = BASE64.decode(media.get("payload_base64")?.as_str()?).ok()?;
+    let required = width.checked_mul(height)?.checked_mul(channels)?;
+    if bytes.len() < required {
+        return None;
+    }
+    let scale = (width as f32 / 176.0).max(height as f32 / 112.0).max(1.0);
+    let thumb_width = ((width as f32 / scale).round() as usize).max(1);
+    let thumb_height = ((height as f32 / scale).round() as usize).max(1);
+    let encoding = metadata
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("bgr8");
+    let mut rgb = Vec::with_capacity(thumb_width * thumb_height * 3);
+    for y in 0..thumb_height {
+        let source_y = (y * height / thumb_height).min(height - 1);
+        for x in 0..thumb_width {
+            let source_x = (x * width / thumb_width).min(width - 1);
+            let offset = (source_y * width + source_x) * channels;
+            let pixel = &bytes[offset..offset + 3];
+            if encoding.eq_ignore_ascii_case("rgb8") {
+                rgb.extend_from_slice(pixel);
+            } else {
+                rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+            }
+        }
+    }
+    Some(EventThumbnail {
+        width: thumb_width,
+        height: thumb_height,
+        rgb,
+    })
+}
+
+fn parse_model_status(sample: &Value) -> Option<ModelStatus> {
+    let data = sample_data(sample)?;
+    if data.get("schema").and_then(Value::as_str) != Some("hab.model.status.v1") {
+        return None;
+    }
+    Some(ModelStatus {
+        node: data.get("node")?.as_str()?.to_owned(),
+        event_type: data
+            .get("event_type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        state: data
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        model_name: data
+            .get("model_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model_version: data
+            .get("model_version")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model_backend: data
+            .get("model_backend")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        model_runtime: data
+            .get("model_runtime")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        warmup_latency_ms: data
+            .get("warmup_latency_ms")
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+        timestamp_ns: data
+            .get("timestamp_ns")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        error: data
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
     })
 }
 
@@ -2059,6 +2292,9 @@ mod tests {
                     "label": "object",
                     "confidence": 0.82,
                     "node": "grasp_detector",
+                    "source_stream_id": "camera_pipeline.frame",
+                    "source_sequence": 17,
+                    "evidence": {"media_kind": "image"},
                     "model": {
                         "name": "grasp_v4",
                         "version": "4.1.0",
@@ -2080,6 +2316,61 @@ mod tests {
         assert_eq!(event.model_backend, "cpp_hook");
         assert_eq!(event.model_runtime, "native_cpp");
         assert!((event.inference_latency_ms - 3.25).abs() < f64::EPSILON);
+        assert_eq!(event.source_stream_id, "camera_pipeline.frame");
+        assert_eq!(event.source_sequence, 17);
+        assert_eq!(event.media_kind, "image");
+        assert!(event.thumbnail.is_none());
+    }
+
+    #[test]
+    fn parses_model_readiness_status() {
+        let status = parse_model_status(&json!({
+            "data": {
+                "schema": "hab.model.status.v1",
+                "node": "scene_classifier",
+                "event_type": "scene",
+                "state": "ready",
+                "model_name": "places365_resnet18",
+                "model_version": "places365-2017",
+                "model_backend": "python_callable",
+                "model_runtime": "python",
+                "warmup_latency_ms": 2024.5,
+                "timestamp_ns": 42i64,
+                "error": ""
+            }
+        }))
+        .expect("model status should parse");
+        assert_eq!(status.node, "scene_classifier");
+        assert_eq!(status.state, "ready");
+        assert_eq!(status.model_name, "places365_resnet18");
+        assert!((status.warmup_latency_ms - 2024.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decodes_event_evidence_thumbnail() {
+        let event = parse_timeline_event(
+            "scene_classifier.events",
+            &json!({
+                "data": {
+                    "event_type": "scene",
+                    "timestamp_ns": 1i64,
+                    "media": {
+                        "kind": "image",
+                        "metadata": {
+                            "width": 2,
+                            "height": 1,
+                            "channels": 3,
+                            "encoding": "bgr8"
+                        },
+                        "payload_base64": BASE64.encode([0, 10, 255, 100, 50, 0])
+                    }
+                }
+            }),
+        )
+        .expect("event should parse");
+        let thumbnail = event.thumbnail.expect("event thumbnail");
+        assert_eq!((thumbnail.width, thumbnail.height), (2, 1));
+        assert_eq!(thumbnail.rgb, [255, 10, 0, 0, 50, 100]);
     }
 
     #[test]

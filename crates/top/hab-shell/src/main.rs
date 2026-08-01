@@ -7,6 +7,7 @@ mod pipeline_ui;
 mod services;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -182,6 +183,7 @@ struct HabShell {
     timeline_search: String,
     camera_texture: Option<egui::TextureHandle>,
     camera_texture_sequence: Option<(u64, i64)>,
+    event_textures: HashMap<String, egui::TextureHandle>,
     playback_playing: bool,
     playback_speed: f32,
     playback_last_tick: Instant,
@@ -220,6 +222,7 @@ impl HabShell {
             timeline_search: String::new(),
             camera_texture: None,
             camera_texture_sequence: None,
+            event_textures: HashMap::new(),
             playback_playing: false,
             playback_speed: 1.0,
             playback_last_tick: Instant::now(),
@@ -448,6 +451,18 @@ impl HabShell {
         if !matches!(self.workspace, Workspace::Timeline | Workspace::Streams) {
             return;
         }
+        let ready_models = self
+            .services
+            .model_statuses
+            .iter()
+            .filter(|status| status.state == "ready")
+            .count();
+        let model_errors = self
+            .services
+            .model_statuses
+            .iter()
+            .filter(|status| status.state == "error")
+            .count();
 
         egui::Panel::top("hab_page_header")
             .exact_size(if self.workspace == Workspace::Timeline {
@@ -476,7 +491,7 @@ impl HabShell {
                             );
                             ui.label(
                                 egui::RichText::new(
-                                    "Model events from the native C++ inspector_live graph",
+                                    "Model events from the canonical inspector_live graph",
                                 )
                                 .size(11.0)
                                 .color(MUTED),
@@ -510,6 +525,25 @@ impl HabShell {
                                 },
                                 PAPER,
                             );
+                            status_chip(
+                                ui,
+                                &format!(
+                                    "{ready_models}/4 MODELS READY{}",
+                                    if model_errors > 0 {
+                                        format!(" Â· {model_errors} ERROR")
+                                    } else {
+                                        String::new()
+                                    }
+                                ),
+                                if model_errors > 0 {
+                                    egui::Color32::DARK_RED
+                                } else if ready_models == 4 {
+                                    SUCCESS
+                                } else {
+                                    WARNING
+                                },
+                                PAPER,
+                            );
                         });
                     });
                 } else {
@@ -532,6 +566,7 @@ impl HabShell {
 
     fn timeline_event_feed(&mut self, ui: &mut egui::Ui) {
         let mut clear = false;
+        let mut review_timestamp_ns = None;
         let filter_kinds = ["grasp", "scene", "speech", "wake"];
         egui::Panel::right("hab_timeline_event_feed")
             .exact_size(370.0)
@@ -617,7 +652,7 @@ impl HabShell {
                                 );
                                 ui.label(
                                     egui::RichText::new(
-                                        "Camera and audio events will appear here as the C++ nodes emit them.",
+                                        "Camera and audio events will appear here as model nodes emit them.",
                                     )
                                     .size(11.0)
                                     .color(MUTED),
@@ -625,13 +660,51 @@ impl HabShell {
                             });
                         }
                         for event in &visible {
-                            timeline_event_card(ui, event);
+                            if !self.event_textures.contains_key(&event.id)
+                                && let Some(thumbnail) = &event.thumbnail
+                            {
+                                let image = egui::ColorImage::from_rgb(
+                                    [thumbnail.width, thumbnail.height],
+                                    &thumbnail.rgb,
+                                );
+                                let texture = ui.ctx().load_texture(
+                                    format!("hab-event-evidence-{}", event.id),
+                                    image,
+                                    egui::TextureOptions::LINEAR,
+                                );
+                                self.event_textures.insert(event.id.clone(), texture);
+                            }
+                            if timeline_event_card(
+                                ui,
+                                event,
+                                self.event_textures.get(&event.id),
+                            )
+                            .clicked()
+                            {
+                                review_timestamp_ns = Some(event.timestamp_ns);
+                            }
                             ui.add_space(8.0);
                         }
                     });
             });
         if clear {
             self.services.clear_timeline();
+            self.event_textures.clear();
+        }
+        if let Some(timestamp_ns) = review_timestamp_ns {
+            self.rerun_app.hab_prepare_playback();
+            if self.rerun_app.hab_seek_playback(timestamp_ns) {
+                self.workspace = Workspace::Playback;
+                self.playback_sub = PlaybackSub::Canvas;
+                self.playback_playing = false;
+                self.playback_last_tick = Instant::now();
+                self.playback_texture_key = Some(("event-seek".to_owned(), timestamp_ns));
+                self.show_stub_notice("Playback moved to the selected event evidence");
+            } else {
+                self.show_stub_notice(
+                    "The selected event is not available in the active Rerun recording yet",
+                );
+            }
         }
     }
 
@@ -910,6 +983,15 @@ impl HabShell {
                     .find(|metric| metric.id == node.id)
             })
             .cloned();
+        let selected_status = selected_index
+            .and_then(|index| self.pipeline.nodes.get(index))
+            .and_then(|node| {
+                self.services
+                    .model_statuses
+                    .iter()
+                    .find(|status| status.node == node.id)
+            })
+            .cloned();
         let mut apply_parameter: Option<(String, String, String)> = None;
         egui::Panel::right("hab_pipeline_inspector")
             .exact_size(360.0)
@@ -971,6 +1053,40 @@ impl HabShell {
                                     "Jitter",
                                     &format!("± {:.2} ms", metric.jitter_ms),
                                 );
+                            }
+                            if let Some(status) = &selected_status {
+                                key_value(ui, "Model state", &status.state.to_ascii_uppercase());
+                                key_value(ui, "Event type", &status.event_type);
+                                key_value(
+                                    ui,
+                                    "Model",
+                                    &if status.model_version.is_empty() {
+                                        status.model_name.clone()
+                                    } else {
+                                        format!("{}@{}", status.model_name, status.model_version)
+                                    },
+                                );
+                                key_value(
+                                    ui,
+                                    "Execution",
+                                    &format!(
+                                        "{} Â· {}",
+                                        status.model_runtime, status.model_backend
+                                    ),
+                                );
+                                key_value(
+                                    ui,
+                                    "Startup warm-up",
+                                    &format!("{:.2} ms", status.warmup_latency_ms),
+                                );
+                                key_value(ui, "Heartbeat", &status.clock_time());
+                                if !status.error.is_empty() {
+                                    ui.add_space(8.0);
+                                    ui.colored_label(
+                                        egui::Color32::DARK_RED,
+                                        &status.error,
+                                    );
+                                }
                             }
                         });
                         ui.add_space(16.0);
@@ -1072,6 +1188,18 @@ impl HabShell {
     }
 
     fn pipeline_page(&mut self, ui: &mut egui::Ui) {
+        let ready_models = self
+            .services
+            .model_statuses
+            .iter()
+            .filter(|status| status.state == "ready")
+            .count();
+        let model_errors = self
+            .services
+            .model_statuses
+            .iter()
+            .filter(|status| status.state == "error")
+            .count();
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(PAPER))
             .show_inside(ui, |ui| {
@@ -1116,6 +1244,22 @@ impl HabShell {
                                 WARNING
                             },
                             if self.services.snapshot.connected {
+                                SUCCESS_SOFT
+                            } else {
+                                PAPER
+                            },
+                        );
+                        status_chip(
+                            ui,
+                            &format!("{ready_models}/4 MODELS READY"),
+                            if model_errors > 0 {
+                                egui::Color32::DARK_RED
+                            } else if ready_models == 4 {
+                                SUCCESS
+                            } else {
+                                WARNING
+                            },
+                            if ready_models == 4 {
                                 SUCCESS_SOFT
                             } else {
                                 PAPER
@@ -3795,9 +3939,13 @@ fn filter_chip(
     )
 }
 
-fn timeline_event_card(ui: &mut egui::Ui, event: &services::TimelineEvent) {
+fn timeline_event_card(
+    ui: &mut egui::Ui,
+    event: &services::TimelineEvent,
+    evidence_texture: Option<&egui::TextureHandle>,
+) -> egui::Response {
     let color = timeline_kind_color(&event.kind);
-    egui::Frame::new()
+    let frame = egui::Frame::new()
         .fill(PAPER)
         .stroke(egui::Stroke::new(1.0, BORDER))
         .corner_radius(8.0)
@@ -3840,6 +3988,23 @@ fn timeline_event_card(ui: &mut egui::Ui, event: &services::TimelineEvent) {
                     if !event.summary.is_empty() {
                         ui.label(egui::RichText::new(&event.summary).size(10.0).color(MUTED));
                     }
+                    if let Some(texture) = evidence_texture {
+                        ui.add_space(7.0);
+                        let width = ui.available_width().min(248.0);
+                        let texture_size = texture.size_vec2();
+                        let height = width * texture_size.y / texture_size.x.max(1.0);
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(width, height.min(148.0)),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().rect_filled(rect, 6.0, ELEVATED);
+                        ui.painter().image(
+                            texture.id(),
+                            rect,
+                            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
                     ui.add_space(5.0);
                     ui.horizontal_wrapped(|ui| {
                         if !event.label.is_empty() {
@@ -3851,6 +4016,23 @@ fn timeline_event_card(ui: &mut egui::Ui, event: &services::TimelineEvent) {
                                     .size(9.0)
                                     .monospace()
                                     .color(TERTIARY),
+                            );
+                        }
+                        if !event.source_stream_id.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} #{}{}",
+                                    event.source_stream_id,
+                                    event.source_sequence,
+                                    if event.media_kind.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" Â· {}", event.media_kind)
+                                    }
+                                ))
+                                .size(8.5)
+                                .monospace()
+                                .color(TERTIARY),
                             );
                         }
                         if !event.model_name.is_empty() {
@@ -3892,6 +4074,22 @@ fn timeline_event_card(ui: &mut egui::Ui, event: &services::TimelineEvent) {
                 });
             });
         });
+    let response = ui.interact(
+        frame.response.rect,
+        ui.id().with(("timeline-event", &event.id)),
+        egui::Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter().rect_stroke(
+            response.rect,
+            8.0,
+            egui::Stroke::new(1.5, color.gamma_multiply(0.7)),
+            egui::StrokeKind::Inside,
+        );
+        response.on_hover_text("Open playback at this event")
+    } else {
+        response
+    }
 }
 
 fn dark_button(ui: &mut egui::Ui, label: &str) -> egui::Response {

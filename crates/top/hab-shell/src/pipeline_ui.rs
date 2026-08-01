@@ -679,7 +679,7 @@ mod tests {
         );
         assert!(graph.error.is_none(), "{:?}", graph.error);
         assert_eq!(graph.nodes.len(), 9);
-        assert_eq!(graph.edges.len(), 16);
+        assert_eq!(graph.edges.len(), 20);
         assert_eq!(
             graph
                 .nodes
