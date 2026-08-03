@@ -53,6 +53,8 @@ const CAMERA_STREAM: &str = "camera_pipeline.frame";
 const AUDIO_STREAM: &str = "audio_pipeline.audio";
 const MAX_TIMELINE_EVENTS: usize = 250;
 const MAX_AUDIO_LEVELS: usize = 320;
+const MAX_LIVE_AUDIO_NS: i64 = 30_000_000_000;
+const AUDIO_EVIDENCE_WINDOW_MS: u64 = 1_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct EngineSnapshot {
@@ -93,6 +95,30 @@ pub struct SessionInfo {
 pub struct PreparedPlayback {
     pub source_path: PathBuf,
     pub rrd_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioEvidenceClip {
+    pub wav_path: PathBuf,
+    pub source: PathBuf,
+    pub stream_id: String,
+    pub center_timestamp_ns: i64,
+    pub start_timestamp_ns: i64,
+    pub end_timestamp_ns: i64,
+    pub sample_rate_hz: u32,
+    pub channels: u16,
+    pub frames: usize,
+    pub levels: Vec<f32>,
+}
+
+impl AudioEvidenceClip {
+    pub fn duration_s(&self) -> f64 {
+        if self.sample_rate_hz == 0 {
+            0.0
+        } else {
+            self.frames as f64 / self.sample_rate_hz as f64
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -156,6 +182,7 @@ pub struct AudioFrame {
     pub source: String,
     pub sample_format: String,
     pub levels: Vec<f32>,
+    pub samples: Vec<f32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -222,6 +249,10 @@ enum WorkerCommand {
     StartRecording(PathBuf),
     StopRecording,
     PrepareHdf5Playback(PathBuf),
+    PrepareAudioEvidence {
+        source_path: PathBuf,
+        timestamp_ns: i64,
+    },
     RunConfig(PathBuf),
     StopEngine,
     StartSyntheticDevice,
@@ -233,6 +264,7 @@ enum WorkerEvent {
     RecordingStarted(Result<PathBuf, String>),
     RecordingStopped(Result<String, String>),
     Hdf5PlaybackPrepared(Result<PreparedPlayback, String>),
+    AudioEvidencePrepared(Result<AudioEvidenceClip, String>),
     ConfigStarted(Result<PathBuf, String>),
     EngineStopped(Result<String, String>),
 }
@@ -271,6 +303,10 @@ pub struct NativeServices {
     pub audio_channels: u16,
     pub audio_source: String,
     pub audio_sample_format: String,
+    audio_frames: VecDeque<AudioFrame>,
+    pub audio_evidence: Option<AudioEvidenceClip>,
+    pub audio_evidence_pending: bool,
+    pub audio_evidence_error: Option<String>,
     prepared_playback: Option<PreparedPlayback>,
     pub busy: bool,
     last_probe: Instant,
@@ -327,6 +363,10 @@ impl NativeServices {
             audio_channels: 0,
             audio_source: "waiting".to_owned(),
             audio_sample_format: String::new(),
+            audio_frames: VecDeque::new(),
+            audio_evidence: None,
+            audio_evidence_pending: false,
+            audio_evidence_error: None,
             prepared_playback: None,
             busy: false,
             last_probe: Instant::now() - Duration::from_secs(10),
@@ -427,6 +467,23 @@ impl NativeServices {
                         }
                     }
                 }
+                WorkerEvent::AudioEvidencePrepared(result) => {
+                    self.audio_evidence_pending = false;
+                    match result {
+                        Ok(clip) => {
+                            notices.push(format!(
+                                "Prepared {:.2} s of event audio evidence",
+                                clip.duration_s()
+                            ));
+                            self.audio_evidence = Some(clip);
+                            self.audio_evidence_error = None;
+                        }
+                        Err(error) => {
+                            self.audio_evidence_error = Some(error.clone());
+                            notices.push(format!("Audio evidence failed: {error}"));
+                        }
+                    }
+                }
                 WorkerEvent::ConfigStarted(result) => {
                     self.busy = false;
                     match result {
@@ -487,11 +544,18 @@ impl NativeServices {
                     self.audio_timestamp_ns = frame.timestamp_ns;
                     self.audio_sample_rate_hz = frame.sample_rate_hz;
                     self.audio_channels = frame.channels;
-                    self.audio_source = frame.source;
-                    self.audio_sample_format = frame.sample_format;
-                    self.audio_levels.extend(frame.levels);
+                    self.audio_source = frame.source.clone();
+                    self.audio_sample_format = frame.sample_format.clone();
+                    self.audio_levels.extend(frame.levels.iter().copied());
                     while self.audio_levels.len() > MAX_AUDIO_LEVELS {
                         self.audio_levels.pop_front();
+                    }
+                    let newest_timestamp_ns = frame.timestamp_ns;
+                    self.audio_frames.push_back(frame);
+                    while self.audio_frames.front().is_some_and(|oldest| {
+                        newest_timestamp_ns.saturating_sub(oldest.timestamp_ns) > MAX_LIVE_AUDIO_NS
+                    }) {
+                        self.audio_frames.pop_front();
                     }
                 }
                 TimelineListenerEvent::ModelStatus(status) => {
@@ -599,6 +663,50 @@ impl NativeServices {
 
     pub fn take_prepared_playback(&mut self) -> Option<PreparedPlayback> {
         self.prepared_playback.take()
+    }
+
+    /// Prepare lossless PCM centered on a Timeline event or playback cursor.
+    /// The recent live ring wins; older evidence falls back to the selected
+    /// session's HDF5 twin because RRD intentionally stores only audio RMS.
+    pub fn request_audio_evidence(&mut self, timestamp_ns: i64) -> bool {
+        if self.audio_evidence_pending {
+            return false;
+        }
+        self.audio_evidence_error = None;
+        if let Ok(clip) = build_live_audio_evidence(&self.root, &self.audio_frames, timestamp_ns) {
+            self.audio_evidence = Some(clip);
+            return true;
+        }
+
+        let active_hdf5 = self
+            .recording_path
+            .as_ref()
+            .map(|path| path.with_extension("h5"))
+            .filter(|path| path.is_file());
+        let Some(source_path) =
+            active_hdf5.or_else(|| self.selected_hdf5_path().map(Path::to_owned))
+        else {
+            return false;
+        };
+        self.audio_evidence_pending = true;
+        if self
+            .command_tx
+            .send(WorkerCommand::PrepareAudioEvidence {
+                source_path,
+                timestamp_ns,
+            })
+            .is_err()
+        {
+            self.audio_evidence_pending = false;
+            return false;
+        }
+        true
+    }
+
+    pub fn clear_audio_evidence(&mut self) {
+        self.audio_evidence = None;
+        self.audio_evidence_pending = false;
+        self.audio_evidence_error = None;
     }
 
     pub fn set_parameter(
@@ -807,7 +915,6 @@ fn timeline_listener_loop(event_tx: mpsc::Sender<TimelineListenerEvent>) {
                 }
 
                 let mut last_camera_preview = Instant::now() - Duration::from_secs(1);
-                let mut last_audio_preview = Instant::now() - Duration::from_secs(1);
                 loop {
                     match socket.read() {
                         Ok(Message::Text(text)) => {
@@ -844,17 +951,19 @@ fn timeline_listener_loop(event_tx: mpsc::Sender<TimelineListenerEvent>) {
                                     return;
                                 }
                             }
-                            if last_audio_preview.elapsed() >= Duration::from_millis(40)
-                                && let Some(sample) = batches
-                                    .get(AUDIO_STREAM)
-                                    .and_then(|batch| batch.get("samples"))
-                                    .and_then(Value::as_array)
-                                    .and_then(|samples| samples.last())
-                                && let Some(frame) = parse_audio_frame(sample)
+                            if let Some(samples) = batches
+                                .get(AUDIO_STREAM)
+                                .and_then(|batch| batch.get("samples"))
+                                .and_then(Value::as_array)
                             {
-                                last_audio_preview = Instant::now();
-                                if event_tx.send(TimelineListenerEvent::Audio(frame)).is_err() {
-                                    return;
+                                for sample in samples {
+                                    if let Some(frame) = parse_audio_frame(sample)
+                                        && event_tx
+                                            .send(TimelineListenerEvent::Audio(frame))
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
                                 }
                             }
                             for stream in TIMELINE_STREAMS {
@@ -1073,6 +1182,7 @@ fn parse_audio_frame(sample: &Value) -> Option<AudioFrame> {
         // The UI visualizes a rolling block envelope. Raw PCM samples made a
         // live microphone look like static noise even when the signal was valid.
         levels: vec![rms],
+        samples,
     })
 }
 
@@ -1403,6 +1513,14 @@ fn worker_loop(
             WorkerCommand::PrepareHdf5Playback(path) => {
                 WorkerEvent::Hdf5PlaybackPrepared(prepare_hdf5_playback(&root, &path))
             }
+            WorkerCommand::PrepareAudioEvidence {
+                source_path,
+                timestamp_ns,
+            } => WorkerEvent::AudioEvidencePrepared(prepare_hdf5_audio_evidence(
+                &root,
+                &source_path,
+                timestamp_ns,
+            )),
             WorkerCommand::RunConfig(path) => {
                 WorkerEvent::ConfigStarted(restart_stack(&root, &path).map(|()| path))
             }
@@ -1572,6 +1690,282 @@ fn prepare_hdf5_playback(root: &Path, source_path: &Path) -> Result<PreparedPlay
     Ok(PreparedPlayback {
         source_path: source_path.to_owned(),
         rrd_path: output_path,
+    })
+}
+
+fn build_live_audio_evidence(
+    root: &Path,
+    frames: &VecDeque<AudioFrame>,
+    center_timestamp_ns: i64,
+) -> Result<AudioEvidenceClip, String> {
+    let reference = frames
+        .iter()
+        .min_by_key(|frame| frame.timestamp_ns.abs_diff(center_timestamp_ns))
+        .ok_or_else(|| "live audio buffer is empty".to_owned())?;
+    if reference.timestamp_ns.abs_diff(center_timestamp_ns) > MAX_LIVE_AUDIO_NS as u64 {
+        return Err("event is outside the live audio buffer".to_owned());
+    }
+    let sample_rate_hz = reference.sample_rate_hz;
+    let channels = reference.channels;
+    if sample_rate_hz == 0 || channels == 0 {
+        return Err("live audio format is incomplete".to_owned());
+    }
+    let requested_start_ns = center_timestamp_ns
+        .saturating_sub(i64::try_from(AUDIO_EVIDENCE_WINDOW_MS).unwrap_or_default() * 1_000_000);
+    let requested_end_ns = center_timestamp_ns
+        .saturating_add(i64::try_from(AUDIO_EVIDENCE_WINDOW_MS).unwrap_or_default() * 1_000_000);
+    let mut samples = Vec::new();
+    let mut start_timestamp_ns = i64::MAX;
+    let mut end_timestamp_ns = i64::MIN;
+    for frame in frames {
+        if frame.sample_rate_hz != sample_rate_hz || frame.channels != channels {
+            continue;
+        }
+        let channel_count = usize::from(channels);
+        let frame_count = frame.samples.len() / channel_count;
+        if frame_count == 0 {
+            continue;
+        }
+        let block_end_ns = frame.timestamp_ns.saturating_add(
+            i64::try_from((frame_count as u128 * 1_000_000_000_u128) / u128::from(sample_rate_hz))
+                .unwrap_or(i64::MAX),
+        );
+        let overlap_start_ns = requested_start_ns.max(frame.timestamp_ns);
+        let overlap_end_ns = requested_end_ns.min(block_end_ns);
+        if overlap_end_ns <= overlap_start_ns {
+            continue;
+        }
+        let first_frame = usize::try_from(
+            (overlap_start_ns.saturating_sub(frame.timestamp_ns) as u128
+                * u128::from(sample_rate_hz))
+                / 1_000_000_000_u128,
+        )
+        .unwrap_or_default()
+        .min(frame_count);
+        let end_frame = usize::try_from(
+            (overlap_end_ns.saturating_sub(frame.timestamp_ns) as u128
+                * u128::from(sample_rate_hz))
+            .div_ceil(1_000_000_000_u128),
+        )
+        .unwrap_or(frame_count)
+        .min(frame_count);
+        if end_frame <= first_frame {
+            continue;
+        }
+        samples.extend_from_slice(
+            &frame.samples[first_frame * channel_count..end_frame * channel_count],
+        );
+        let actual_start_ns = frame.timestamp_ns.saturating_add(
+            i64::try_from((first_frame as u128 * 1_000_000_000_u128) / u128::from(sample_rate_hz))
+                .unwrap_or_default(),
+        );
+        let actual_end_ns = frame.timestamp_ns.saturating_add(
+            i64::try_from((end_frame as u128 * 1_000_000_000_u128) / u128::from(sample_rate_hz))
+                .unwrap_or_default(),
+        );
+        start_timestamp_ns = start_timestamp_ns.min(actual_start_ns);
+        end_timestamp_ns = end_timestamp_ns.max(actual_end_ns);
+    }
+    if samples.is_empty() {
+        return Err("no live PCM overlaps the event window".to_owned());
+    }
+    let output_path = root
+        .join("data")
+        .join("playback_cache")
+        .join(format!("live-{center_timestamp_ns}.event-audio.wav"));
+    write_pcm16_wav(&output_path, &samples, sample_rate_hz, channels)?;
+    let levels = audio_envelope(&samples, usize::from(channels), 96);
+    Ok(AudioEvidenceClip {
+        wav_path: output_path,
+        source: PathBuf::from("live WebSocket PCM"),
+        stream_id: AUDIO_STREAM.to_owned(),
+        center_timestamp_ns,
+        start_timestamp_ns,
+        end_timestamp_ns,
+        sample_rate_hz,
+        channels,
+        frames: samples.len() / usize::from(channels),
+        levels,
+    })
+}
+
+fn write_pcm16_wav(
+    path: &Path,
+    samples: &[f32],
+    sample_rate_hz: u32,
+    channels: u16,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let data_bytes = u32::try_from(samples.len().saturating_mul(2))
+        .map_err(|_| "audio evidence is too large for WAV".to_owned())?;
+    let byte_rate = sample_rate_hz
+        .checked_mul(u32::from(channels))
+        .and_then(|value| value.checked_mul(2))
+        .ok_or_else(|| "invalid WAV byte rate".to_owned())?;
+    let block_align = channels
+        .checked_mul(2)
+        .ok_or_else(|| "invalid WAV channel count".to_owned())?;
+    let mut wav = Vec::with_capacity(44 + data_bytes as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&data_bytes.saturating_add(36).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&channels.to_le_bytes());
+    wav.extend_from_slice(&sample_rate_hz.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&block_align.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_bytes.to_le_bytes());
+    for sample in samples {
+        let value = (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
+        wav.extend_from_slice(&value.to_le_bytes());
+    }
+    let partial_path = path.with_extension("wav.partial");
+    let _ = fs::remove_file(&partial_path);
+    fs::write(&partial_path, wav).map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(path);
+    fs::rename(&partial_path, path).map_err(|error| {
+        let _ = fs::remove_file(&partial_path);
+        error.to_string()
+    })
+}
+
+fn audio_envelope(samples: &[f32], channels: usize, bins: usize) -> Vec<f32> {
+    if samples.is_empty() || channels == 0 || bins == 0 {
+        return Vec::new();
+    }
+    let frame_count = samples.len() / channels;
+    let bin_count = bins.min(frame_count);
+    (0..bin_count)
+        .map(|bin| {
+            let start = bin * frame_count / bin_count;
+            let end = ((bin + 1) * frame_count / bin_count).max(start + 1);
+            let mut square_sum = 0.0_f32;
+            let mut count = 0_usize;
+            for frame in start..end.min(frame_count) {
+                for channel in 0..channels {
+                    let sample = samples[frame * channels + channel];
+                    square_sum += sample * sample;
+                    count += 1;
+                }
+            }
+            (square_sum / count.max(1) as f32).sqrt()
+        })
+        .collect()
+}
+
+fn prepare_hdf5_audio_evidence(
+    root: &Path,
+    source_path: &Path,
+    timestamp_ns: i64,
+) -> Result<AudioEvidenceClip, String> {
+    if !source_path.is_file() {
+        return Err(format!("HDF5 session missing: {}", source_path.display()));
+    }
+    let script = root.join("scripts").join("hab_hdf5_audio_clip.py");
+    if !script.is_file() {
+        return Err(format!(
+            "audio evidence adapter missing: {}",
+            script.display()
+        ));
+    }
+    let mut hasher = DefaultHasher::new();
+    source_path.hash(&mut hasher);
+    timestamp_ns.hash(&mut hasher);
+    fs::metadata(source_path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(UNIX_EPOCH)
+        .hash(&mut hasher);
+    let output_path = root
+        .join("data")
+        .join("playback_cache")
+        .join(format!("{:016x}.event-audio.wav", hasher.finish()));
+    let python = if let Ok(explicit) = std::env::var("HAB_PYTHON") {
+        PathBuf::from(explicit)
+    } else if cfg!(target_os = "windows") {
+        root.join(".venv").join("Scripts").join("python.exe")
+    } else {
+        root.join(".venv").join("bin").join("python")
+    };
+    let mut command = Command::new(&python);
+    command
+        .current_dir(root)
+        .arg(&script)
+        .arg("--h5")
+        .arg(source_path)
+        .arg("--out")
+        .arg(&output_path)
+        .arg("--timestamp-ns")
+        .arg(timestamp_ns.to_string())
+        .arg("--before-ms")
+        .arg(AUDIO_EVIDENCE_WINDOW_MS.to_string())
+        .arg("--after-ms")
+        .arg(AUDIO_EVIDENCE_WINDOW_MS.to_string());
+    hide_window(&mut command);
+    let output = command.output().map_err(|error| {
+        format!(
+            "failed to start {} for audio evidence: {error}",
+            python.display()
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("audio evidence adapter exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("invalid audio evidence result: {error}"))?;
+    if value.get("schema").and_then(Value::as_str) != Some("hab.audio-evidence.v1") {
+        return Err("unsupported audio evidence result".to_owned());
+    }
+    let levels = value
+        .get("levels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_f64)
+        .map(|level| level as f32)
+        .collect();
+    Ok(AudioEvidenceClip {
+        wav_path: output_path,
+        source: source_path.to_owned(),
+        stream_id: value
+            .get("stream_id")
+            .and_then(Value::as_str)
+            .unwrap_or(AUDIO_STREAM)
+            .to_owned(),
+        center_timestamp_ns: timestamp_ns,
+        start_timestamp_ns: value
+            .get("start_timestamp_ns")
+            .and_then(Value::as_i64)
+            .unwrap_or(timestamp_ns),
+        end_timestamp_ns: value
+            .get("end_timestamp_ns")
+            .and_then(Value::as_i64)
+            .unwrap_or(timestamp_ns),
+        sample_rate_hz: value
+            .get("sample_rate_hz")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or_default(),
+        channels: value
+            .get("channels")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or_default(),
+        frames: value
+            .get("frames")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or_default(),
+        levels,
     })
 }
 
@@ -2452,5 +2846,37 @@ mod tests {
         assert!(frame.rms > 0.7 && frame.rms < 0.8);
         assert!(frame.peak > 0.99);
         assert_eq!(frame.source, "unknown");
+        assert_eq!(frame.samples.len(), 4);
+        assert!(frame.samples[0] <= -1.0);
+    }
+
+    #[test]
+    fn builds_event_centered_audio_from_live_ring() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("hab-audio-evidence-{nonce}"));
+        let mut frames = VecDeque::new();
+        for index in 0..3 {
+            frames.push_back(AudioFrame {
+                timestamp_ns: 1_000_000_000 + index * 20_000_000,
+                sample_rate_hz: 16_000,
+                channels: 1,
+                source: "test".to_owned(),
+                sample_format: "s16le".to_owned(),
+                samples: vec![0.25; 320],
+                ..Default::default()
+            });
+        }
+
+        let clip = build_live_audio_evidence(&root, &frames, 1_020_000_000)
+            .expect("live clip should build");
+
+        assert!(clip.wav_path.is_file());
+        assert_eq!(clip.frames, 960);
+        assert_eq!(clip.sample_rate_hz, 16_000);
+        assert_eq!(clip.levels.len(), 96);
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -692,6 +692,7 @@ impl HabShell {
             self.event_textures.clear();
         }
         if let Some(timestamp_ns) = review_timestamp_ns {
+            let _ = self.services.request_audio_evidence(timestamp_ns);
             self.rerun_app.hab_prepare_playback();
             if self.rerun_app.hab_seek_playback(timestamp_ns) {
                 self.workspace = Workspace::Playback;
@@ -1416,6 +1417,9 @@ impl HabShell {
             .cloned();
         let mut return_to_sessions = false;
         let mut open_expert = false;
+        let mut request_audio = false;
+        let mut play_audio = false;
+        let mut stop_audio = false;
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
@@ -1591,6 +1595,155 @@ impl HabShell {
                     });
 
                     ui.add_space(14.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), 250.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| media_card(ui, "EVENT AUDIO EVIDENCE", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Audio around the playback cursor")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(TEXT),
+                                );
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Lossless PCM is loaded from the 30-second live ring or the synchronized HDF5 recording.",
+                                    )
+                                    .size(10.0)
+                                    .color(MUTED),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if self.services.audio_evidence_pending {
+                                        status_chip(ui, "PREPARING", WARNING, PAPER);
+                                    } else if self.services.audio_evidence_error.is_some() {
+                                        status_chip(
+                                            ui,
+                                            "AUDIO UNAVAILABLE",
+                                            egui::Color32::from_rgb(190, 64, 62),
+                                            PAPER,
+                                        );
+                                    } else if self.services.audio_evidence.is_some() {
+                                        status_chip(ui, "PCM READY", SUCCESS, PAPER);
+                                    } else {
+                                        status_chip(ui, "NOT LOADED", TERTIARY, PAPER);
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(10.0);
+                        if let Some(clip) = &self.services.audio_evidence {
+                            let peak = clip.levels.iter().copied().fold(0.0_f32, f32::max);
+                            let rms = if clip.levels.is_empty() {
+                                0.0
+                            } else {
+                                (clip
+                                    .levels
+                                    .iter()
+                                    .map(|value| value * value)
+                                    .sum::<f32>()
+                                    / clip.levels.len() as f32)
+                                    .sqrt()
+                            };
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 106.0),
+                                egui::Sense::hover(),
+                            );
+                            paint_audio_waveform(ui.painter(), rect, &clip.levels, rms, peak);
+                            let marker_fraction = if clip.end_timestamp_ns > clip.start_timestamp_ns {
+                                (clip.center_timestamp_ns - clip.start_timestamp_ns) as f32
+                                    / (clip.end_timestamp_ns - clip.start_timestamp_ns) as f32
+                            } else {
+                                0.5
+                            }
+                            .clamp(0.0, 1.0);
+                            let marker_x = rect.left() + rect.width() * marker_fraction;
+                            ui.painter().line_segment(
+                                [
+                                    egui::pos2(marker_x, rect.top() + 6.0),
+                                    egui::pos2(marker_x, rect.bottom() - 6.0),
+                                ],
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(224, 92, 89)),
+                            );
+                            ui.painter().text(
+                                egui::pos2(marker_x + 5.0, rect.top() + 8.0),
+                                egui::Align2::LEFT_TOP,
+                                "EVENT",
+                                egui::FontId::monospace(8.5),
+                                egui::Color32::from_rgb(190, 64, 62),
+                            );
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                outlined_chip(ui, &format!("{:.2} s", clip.duration_s()));
+                                outlined_chip(
+                                    ui,
+                                    &format!(
+                                        "{:.1} kHz / {} ch",
+                                        clip.sample_rate_hz as f32 / 1_000.0,
+                                        clip.channels
+                                    ),
+                                );
+                                ui.label(
+                                    egui::RichText::new(&clip.stream_id)
+                                        .size(9.0)
+                                        .monospace()
+                                        .color(TERTIARY),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if outline_button(ui, "STOP AUDIO").clicked() {
+                                            stop_audio = true;
+                                        }
+                                        if dark_button(ui, "PLAY AUDIO").clicked() {
+                                            play_audio = true;
+                                        }
+                                        if outline_button(ui, "RELOAD AT CURSOR").clicked() {
+                                            request_audio = true;
+                                        }
+                                    },
+                                );
+                            });
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Source: {}",
+                                    clip.source.display()
+                                ))
+                                .size(8.5)
+                                .monospace()
+                                .color(TERTIARY),
+                            );
+                            if let Some(error) = &self.services.audio_evidence_error {
+                                ui.label(
+                                    egui::RichText::new(error)
+                                        .size(9.0)
+                                        .color(egui::Color32::from_rgb(190, 64, 62)),
+                                );
+                            }
+                        } else {
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 82.0),
+                                egui::Sense::hover(),
+                            );
+                            paint_empty_media(
+                                ui.painter(),
+                                rect,
+                                NavIcon::Streams,
+                                "Load the exact PCM window around this cursor",
+                            );
+                            ui.add_space(8.0);
+                            if dark_button(ui, "LOAD AUDIO AT CURSOR").clicked() {
+                                request_audio = true;
+                            }
+                        }
+                        }),
+                    );
+
+                    ui.add_space(14.0);
                     info_card(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
@@ -1695,6 +1848,22 @@ impl HabShell {
                     });
                 });
             });
+
+        if request_audio
+            && let Some((_, _, _, current, _)) = snapshot
+            && !self.services.request_audio_evidence(current)
+        {
+            self.show_stub_notice("No live or HDF5 audio is available at this cursor");
+        }
+        if play_audio
+            && let Some(clip) = &self.services.audio_evidence
+            && let Err(error) = play_wav_file(&clip.wav_path)
+        {
+            self.show_stub_notice(error);
+        }
+        if stop_audio {
+            stop_wav_playback();
+        }
 
         if return_to_sessions {
             self.playback_playing = false;
@@ -1897,6 +2066,7 @@ impl HabShell {
             let path = self.services.selected_rrd_path().map(Path::to_owned);
             match path {
                 Some(path) => {
+                    self.services.clear_audio_evidence();
                     self.rerun_app.open_file_path(path.clone());
                     self.playback_loaded_path = Some(path.clone());
                     self.playback_playing = false;
@@ -2809,6 +2979,7 @@ impl eframe::App for HabShell {
             self.show_stub_notice(notice);
         }
         if let Some(prepared) = self.services.take_prepared_playback() {
+            self.services.clear_audio_evidence();
             self.rerun_app.open_file_path(prepared.rrd_path);
             self.playback_loaded_path = Some(prepared.source_path);
             self.playback_playing = false;
@@ -3249,6 +3420,64 @@ fn paint_empty_media(painter: &egui::Painter, rect: egui::Rect, icon: NavIcon, m
 fn amplitude_to_dbfs(amplitude: f32) -> f32 {
     20.0 * amplitude.max(0.000_001).log10()
 }
+
+#[cfg(target_os = "windows")]
+fn play_wav_file(path: &Path) -> Result<(), String> {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt as _};
+
+    const SND_ASYNC: u32 = 0x0001;
+    const SND_NODEFAULT: u32 = 0x0002;
+    const SND_FILENAME: u32 = 0x0002_0000;
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn PlaySoundW(sound: *const u16, module: *mut c_void, flags: u32) -> i32;
+    }
+
+    if !path.is_file() {
+        return Err(format!("Audio evidence is missing: {}", path.display()));
+    }
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: `wide` is a valid, NUL-terminated Windows path for the duration
+    // of the call; SND_FILENAME makes winmm copy/open the named WAV before the
+    // asynchronous playback continues. No module handle is required.
+    let accepted = unsafe {
+        PlaySoundW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            SND_ASYNC | SND_NODEFAULT | SND_FILENAME,
+        )
+    };
+    if accepted == 0 {
+        Err(format!("Windows could not play {}", path.display()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn play_wav_file(_path: &Path) -> Result<(), String> {
+    Err("Audio evidence playback is currently available on Windows".to_owned())
+}
+
+#[cfg(target_os = "windows")]
+fn stop_wav_playback() {
+    use std::ffi::c_void;
+
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        fn PlaySoundW(sound: *const u16, module: *mut c_void, flags: u32) -> i32;
+    }
+    // SAFETY: the documented null sound pointer stops the current PlaySound
+    // waveform; both the module handle and flags are unused for this operation.
+    let _ = unsafe { PlaySoundW(std::ptr::null(), std::ptr::null_mut(), 0) };
+}
+
+#[cfg(not(target_os = "windows"))]
+fn stop_wav_playback() {}
 
 fn paint_audio_waveform(
     painter: &egui::Painter,
