@@ -175,6 +175,16 @@ impl AudioCaptureCategory {
         }
     }
 
+    fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "wake_positive" => Some(Self::WakePositive),
+            "near_wake_negative" => Some(Self::NearWakeNegative),
+            "other_speech" => Some(Self::OtherSpeech),
+            "background" => Some(Self::Background),
+            _ => None,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::WakePositive => "Wake positive",
@@ -199,6 +209,15 @@ impl AudioCaptureCategory {
             Self::NearWakeNegative => "Hey cat",
             Self::OtherSpeech => "Read a short sentence",
             Self::Background => "",
+        }
+    }
+
+    fn suggested_condition(self) -> &'static str {
+        match self {
+            Self::WakePositive => "Natural voice, normal distance.",
+            Self::NearWakeNegative => "Say the exact phrase naturally.",
+            Self::OtherSpeech => "Read the sentence naturally.",
+            Self::Background => "Do not speak during this capture.",
         }
     }
 }
@@ -268,6 +287,7 @@ struct HabShell {
     audio_capture_test_split: bool,
     audio_capture_category: AudioCaptureCategory,
     audio_capture_prompt: String,
+    audio_capture_condition: String,
     audio_capture_duration_s: f32,
     audio_capture_consent: bool,
 }
@@ -315,6 +335,7 @@ impl HabShell {
             audio_capture_test_split: false,
             audio_capture_category: AudioCaptureCategory::WakePositive,
             audio_capture_prompt: "Hey chat".to_owned(),
+            audio_capture_condition: "Natural voice, normal distance.".to_owned(),
             audio_capture_duration_s: 3.0,
             audio_capture_consent: false,
         }
@@ -2830,6 +2851,8 @@ impl HabShell {
 
     fn audio_calibration_page(&mut self, ui: &mut egui::Ui) {
         let summary = self.services.audio_golden_summary.clone();
+        let campaign = self.services.audio_campaign.clone();
+        let campaign_error = self.services.audio_campaign_error.clone();
         let last_case = self.services.audio_golden_last_case.clone();
         let benchmark = self.services.audio_golden_benchmark.clone();
         let capture_progress = self.services.audio_golden_capture_progress();
@@ -2843,10 +2866,17 @@ impl HabShell {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        let selected_split = if self.audio_capture_test_split {
+            "test"
+        } else {
+            "calibration"
+        };
+        let next_target = summary.next_campaign_target(&campaign, selected_split);
         let mut start_capture = false;
         let mut cancel_capture = false;
         let mut run_benchmark = false;
         let mut play_last = false;
+        let mut load_next_target = false;
 
         egui::CentralPanel::default()
             .frame(
@@ -2908,6 +2938,65 @@ impl HabShell {
                             });
                             ui.add_space(16.0);
 
+                            egui::Frame::new()
+                                .fill(INFO_SOFT)
+                                .corner_radius(7.0)
+                                .inner_margin(egui::Margin::same(12))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        section_label(ui, "GUIDED PILOT TARGET");
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                status_chip(
+                                                    ui,
+                                                    if selected_split == "test" {
+                                                        "HELD-OUT TEST"
+                                                    } else {
+                                                        "CALIBRATION"
+                                                    },
+                                                    ACCENT,
+                                                    PAPER,
+                                                );
+                                            },
+                                        );
+                                    });
+                                    if let Some(target) = &next_target {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Next: {} · {}/{} clips · {}/{} speakers",
+                                                target.label,
+                                                target.cases,
+                                                target.case_target,
+                                                target.speakers,
+                                                target.speaker_target
+                                            ))
+                                            .size(12.0)
+                                            .strong()
+                                            .color(TEXT),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&target.instruction)
+                                                .size(9.5)
+                                                .color(MUTED),
+                                        );
+                                        ui.add_space(8.0);
+                                        if outline_button(ui, "LOAD NEXT TARGET").clicked() {
+                                            load_next_target = true;
+                                        }
+                                    } else {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "This split meets every configured category target.",
+                                            )
+                                            .size(10.5)
+                                            .strong()
+                                            .color(SUCCESS),
+                                        );
+                                    }
+                                });
+                            ui.add_space(14.0);
+
                             ui.add_enabled_ui(!capture_active, |ui| {
                                 ui.columns(2, |fields| {
                                     field_label(&mut fields[0], "SPEAKER ID");
@@ -2921,6 +3010,33 @@ impl HabShell {
                                             .desired_width(f32::INFINITY),
                                     );
                                 });
+                                let assigned_splits = summary
+                                    .assigned_splits(&self.audio_capture_speaker);
+                                if !assigned_splits.is_empty() {
+                                    let selected = if self.audio_capture_test_split {
+                                        "test"
+                                    } else {
+                                        "calibration"
+                                    };
+                                    let mismatch = assigned_splits
+                                        .iter()
+                                        .any(|assigned| assigned != selected);
+                                    ui.label(
+                                        egui::RichText::new(if mismatch {
+                                            format!(
+                                                "Speaker is already assigned to {}. Capture will be blocked in {selected}.",
+                                                assigned_splits.join(" + ")
+                                            )
+                                        } else {
+                                            format!(
+                                                "Stable assignment: {}",
+                                                assigned_splits.join(" + ")
+                                            )
+                                        })
+                                        .size(9.0)
+                                        .color(if mismatch { WARNING } else { SUCCESS }),
+                                    );
+                                }
                                 ui.add_space(14.0);
                                 field_label(ui, "SPLIT");
                                 ui.horizontal(|ui| {
@@ -2960,6 +3076,8 @@ impl HabShell {
                                             self.audio_capture_category = category;
                                             self.audio_capture_prompt =
                                                 category.suggested_prompt().to_owned();
+                                            self.audio_capture_condition =
+                                                category.suggested_condition().to_owned();
                                         }
                                         if index == 1 {
                                             category_columns[0].add_space(8.0);
@@ -2979,6 +3097,15 @@ impl HabShell {
                                             "Exact words spoken"
                                         })
                                         .desired_width(f32::INFINITY),
+                                );
+                                ui.add_space(10.0);
+                                field_label(ui, "CAPTURE DIRECTION");
+                                ui.add(
+                                    egui::TextEdit::multiline(
+                                        &mut self.audio_capture_condition,
+                                    )
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY),
                                 );
                                 ui.add_space(12.0);
                                 ui.horizontal(|ui| {
@@ -3043,23 +3170,23 @@ impl HabShell {
                         columns[1].vertical(|ui| {
                             info_card(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    section_label(ui, "GOLDEN-SET COVERAGE");
+                                    section_label(ui, "PILOT CAMPAIGN READINESS");
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
                                             status_chip(
                                                 ui,
-                                                if summary.complete_coverage() {
-                                                    "4/4 COVERED"
+                                                if summary.campaign_ready(&campaign) {
+                                                    "PROMOTION INPUT READY"
                                                 } else {
-                                                    "COVERAGE INCOMPLETE"
+                                                    "PILOT GATE INCOMPLETE"
                                                 },
-                                                if summary.complete_coverage() {
+                                                if summary.campaign_ready(&campaign) {
                                                     SUCCESS
                                                 } else {
                                                     WARNING
                                                 },
-                                                if summary.complete_coverage() {
+                                                if summary.campaign_ready(&campaign) {
                                                     SUCCESS_SOFT
                                                 } else {
                                                     PAPER
@@ -3068,33 +3195,61 @@ impl HabShell {
                                         },
                                     );
                                 });
-                                calibration_coverage_row(
+                                let target = campaign.split_target(selected_split);
+                                campaign_coverage_row(
                                     ui,
                                     "Wake positives",
-                                    summary.wake_positive,
-                                    "‘Hey chat’ from each speaker",
+                                    summary.category_cases(selected_split, "wake_positive"),
+                                    target.minimum_cases_per_category,
+                                    summary.category_speakers(selected_split, "wake_positive"),
+                                    target.minimum_speakers_per_category,
                                 );
-                                calibration_coverage_row(
+                                campaign_coverage_row(
                                     ui,
                                     "Near-wake negatives",
-                                    summary.near_wake_negative,
-                                    "Similar phrases that must not wake",
+                                    summary.category_cases(
+                                        selected_split,
+                                        "near_wake_negative",
+                                    ),
+                                    target.minimum_cases_per_category,
+                                    summary.category_speakers(
+                                        selected_split,
+                                        "near_wake_negative",
+                                    ),
+                                    target.minimum_speakers_per_category,
                                 );
-                                calibration_coverage_row(
+                                campaign_coverage_row(
                                     ui,
                                     "Other speech",
-                                    summary.other_speech,
-                                    "Speech without the wake phrase",
+                                    summary.category_cases(selected_split, "other_speech"),
+                                    target.minimum_cases_per_category,
+                                    summary.category_speakers(selected_split, "other_speech"),
+                                    target.minimum_speakers_per_category,
                                 );
-                                calibration_coverage_row(
+                                campaign_coverage_row(
                                     ui,
                                     "Background / silence",
-                                    summary.background,
-                                    "No-speech operating conditions",
+                                    summary.category_cases(selected_split, "background"),
+                                    target.minimum_cases_per_category,
+                                    summary.category_speakers(selected_split, "background"),
+                                    target.minimum_speakers_per_category,
                                 );
                                 ui.separator();
+                                key_value(
+                                    ui,
+                                    "Viewing split",
+                                    if selected_split == "test" {
+                                        "held-out test"
+                                    } else {
+                                        "calibration"
+                                    },
+                                );
                                 key_value(ui, "Total private clips", &summary.total_cases.to_string());
-                                key_value(ui, "Speakers", &summary.speakers.to_string());
+                                key_value(
+                                    ui,
+                                    "Speakers in split",
+                                    &summary.split_speakers(selected_split).to_string(),
+                                );
                                 key_value(
                                     ui,
                                     "Calibration / test",
@@ -3113,11 +3268,28 @@ impl HabShell {
                                     },
                                 );
                                 ui.label(
-                                    egui::RichText::new(summary.manifest_path.to_string_lossy())
+                                    egui::RichText::new(format!(
+                                        "{} · {} v{}",
+                                        summary.manifest_path.to_string_lossy(),
+                                        campaign.name,
+                                        campaign.version
+                                    ))
                                         .size(8.5)
                                         .monospace()
                                         .color(TERTIARY),
                                 );
+                                ui.label(
+                                    egui::RichText::new(campaign.path.to_string_lossy())
+                                        .size(8.5)
+                                        .monospace()
+                                        .color(TERTIARY),
+                                );
+                                if let Some(error) = &campaign_error {
+                                    ui.colored_label(
+                                        WARNING,
+                                        format!("Campaign fallback active: {error}"),
+                                    );
+                                }
                             });
                             ui.add_space(12.0);
 
@@ -3129,8 +3301,25 @@ impl HabShell {
                                         |ui| {
                                             if self.services.audio_golden_benchmark_pending {
                                                 status_chip(ui, "RUNNING", WARNING, PAPER);
-                                            } else if benchmark.is_some() {
-                                                status_chip(ui, "REPORT READY", SUCCESS, SUCCESS_SOFT);
+                                            } else if let Some(report) = &benchmark {
+                                                status_chip(
+                                                    ui,
+                                                    if report.promotion_eligible {
+                                                        "PILOT GATE PASSED"
+                                                    } else {
+                                                        "CANDIDATE ONLY"
+                                                    },
+                                                    if report.promotion_eligible {
+                                                        SUCCESS
+                                                    } else {
+                                                        WARNING
+                                                    },
+                                                    if report.promotion_eligible {
+                                                        SUCCESS_SOFT
+                                                    } else {
+                                                        PAPER
+                                                    },
+                                                );
                                             }
                                         },
                                     );
@@ -3156,6 +3345,34 @@ impl HabShell {
                                             "LEAKAGE DETECTED"
                                         },
                                     );
+                                    key_value(
+                                        ui,
+                                        "Threshold status",
+                                        if report.promotion_eligible {
+                                            "eligible for pilot promotion review"
+                                        } else {
+                                            "candidate only"
+                                        },
+                                    );
+                                    if !report.promotion_eligible {
+                                        for reason in report.promotion_reasons.iter().take(3) {
+                                            ui.label(
+                                                egui::RichText::new(format!("• {reason}"))
+                                                    .size(8.5)
+                                                    .color(MUTED),
+                                            );
+                                        }
+                                        if report.promotion_reasons.len() > 3 {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "+{} more requirements in report",
+                                                    report.promotion_reasons.len() - 3
+                                                ))
+                                                .size(8.5)
+                                                .color(TERTIARY),
+                                            );
+                                        }
+                                    }
                                     ui.label(
                                         egui::RichText::new(report.report_path.to_string_lossy())
                                             .size(8.5)
@@ -3184,6 +3401,9 @@ impl HabShell {
                                     key_value(ui, "Speaker", &case.speaker_id);
                                     key_value(ui, "Split", &case.split);
                                     key_value(ui, "Category", &case.category);
+                                    if !case.condition.is_empty() {
+                                        key_value(ui, "Condition", &case.condition);
+                                    }
                                     key_value(ui, "Duration", &format!("{:.2} s", case.duration_s));
                                     if outline_button(ui, "PLAY LAST CLIP").clicked() {
                                         play_last = true;
@@ -3196,11 +3416,19 @@ impl HabShell {
                     notice_card(
                         ui,
                         "Keep speakers disjoint",
-                        "A speaker ID must belong to only one split. Use calibration clips to tune thresholds and held-out test clips only for final reporting. Private recordings remain under ignored data/golden_sets and are never added to Git.",
+                        "A speaker ID is blocked from crossing splits. Threshold candidates use the licensed baseline plus calibration clips; held-out test clips are reserved for promotion evidence. Passing this configurable pilot gate is not production validation. Private recordings remain ignored by Git.",
                     );
                 });
             });
 
+        if load_next_target
+            && let Some(target) = next_target
+            && let Some(category) = AudioCaptureCategory::from_key(&target.category)
+        {
+            self.audio_capture_category = category;
+            self.audio_capture_prompt = target.prompt;
+            self.audio_capture_condition = target.instruction;
+        }
         if start_capture {
             let request = services::AudioGoldenCaptureRequest {
                 speaker_id: self.audio_capture_speaker.clone(),
@@ -3213,11 +3441,15 @@ impl HabShell {
                 .to_owned(),
                 category: self.audio_capture_category.key().to_owned(),
                 prompt: self.audio_capture_prompt.clone(),
+                condition: self.audio_capture_condition.clone(),
                 duration_ms: (self.audio_capture_duration_s * 1_000.0).round() as u64,
                 consent: self.audio_capture_consent,
             };
-            if let Err(error) = self.services.start_audio_golden_capture(request) {
-                self.show_stub_notice(format!("Audio capture not started: {error}"));
+            match self.services.start_audio_golden_capture(request) {
+                Ok(()) => self.audio_capture_consent = false,
+                Err(error) => {
+                    self.show_stub_notice(format!("Audio capture not started: {error}"));
+                }
             }
         }
         if cancel_capture && self.services.cancel_audio_golden_capture() {
@@ -4393,25 +4625,39 @@ fn audio_category_button(
     )
 }
 
-fn calibration_coverage_row(ui: &mut egui::Ui, label: &str, count: usize, detail: &str) {
+fn campaign_coverage_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    cases: usize,
+    case_target: usize,
+    speakers: usize,
+    speaker_target: usize,
+) {
+    let ready = cases >= case_target && speakers >= speaker_target;
     egui::Frame::new()
-        .fill(if count > 0 { SUCCESS_SOFT } else { PANEL })
+        .fill(if ready { SUCCESS_SOFT } else { PANEL })
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(11, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                status_dot(ui, if count > 0 { SUCCESS } else { TERTIARY });
+                status_dot(ui, if ready { SUCCESS } else { TERTIARY });
                 ui.vertical(|ui| {
                     ui.label(egui::RichText::new(label).size(10.0).strong().color(TEXT));
-                    ui.label(egui::RichText::new(detail).size(8.5).color(MUTED));
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{speakers}/{speaker_target} distinct speakers"
+                        ))
+                        .size(8.5)
+                        .color(MUTED),
+                    );
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
-                        egui::RichText::new(count.to_string())
-                            .size(15.0)
+                        egui::RichText::new(format!("{cases}/{case_target}"))
+                            .size(13.0)
                             .strong()
                             .monospace()
-                            .color(if count > 0 { SUCCESS } else { TERTIARY }),
+                            .color(if ready { SUCCESS } else { TERTIARY }),
                     );
                 });
             });

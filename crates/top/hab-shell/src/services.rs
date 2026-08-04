@@ -58,6 +58,14 @@ const MAX_LIVE_AUDIO_NS: i64 = 30_000_000_000;
 const AUDIO_EVIDENCE_WINDOW_MS: u64 = 1_000;
 const AUDIO_GOLDEN_MANIFEST_SCHEMA: &str = "hab.inspector-recorded-audio.v1";
 const AUDIO_GOLDEN_MANIFEST_RELATIVE: &str = "data/golden_sets/audio/manifest.json";
+const AUDIO_CAMPAIGN_SCHEMA: &str = "hab.inspector-audio-campaign.v1";
+const AUDIO_CAMPAIGN_RELATIVE: &str = "configs/models/inspector_audio_campaign.json";
+const AUDIO_GOLDEN_CATEGORIES: [&str; 4] = [
+    "wake_positive",
+    "near_wake_negative",
+    "other_speech",
+    "background",
+];
 
 #[derive(Clone, Debug, Default)]
 pub struct EngineSnapshot {
@@ -121,6 +129,7 @@ pub struct AudioGoldenCaptureRequest {
     pub split: String,
     pub category: String,
     pub prompt: String,
+    pub condition: String,
     pub duration_ms: u64,
     pub consent: bool,
 }
@@ -133,7 +142,59 @@ pub struct AudioGoldenCase {
     pub split: String,
     pub category: String,
     pub prompt: String,
+    pub condition: String,
     pub duration_s: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioCampaignPrompt {
+    pub prompt: String,
+    pub instruction: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioCampaignCategory {
+    pub key: String,
+    pub label: String,
+    pub prompts: Vec<AudioCampaignPrompt>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct AudioCampaignSplitTarget {
+    pub minimum_cases_per_category: usize,
+    pub minimum_speakers_per_category: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioCampaignConfig {
+    pub path: PathBuf,
+    pub name: String,
+    pub version: u64,
+    pub calibration: AudioCampaignSplitTarget,
+    pub test: AudioCampaignSplitTarget,
+    pub categories: Vec<AudioCampaignCategory>,
+}
+
+impl AudioCampaignConfig {
+    pub fn split_target(&self, split: &str) -> AudioCampaignSplitTarget {
+        if split == "test" {
+            self.test
+        } else {
+            self.calibration
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioCampaignTarget {
+    pub category: String,
+    pub label: String,
+    pub prompt: String,
+    pub instruction: String,
+    pub cases: usize,
+    pub case_target: usize,
+    pub speakers: usize,
+    pub speaker_target: usize,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -148,18 +209,100 @@ pub struct AudioGoldenSummary {
     pub test_cases: usize,
     pub speakers: usize,
     pub speaker_split_conflicts: Vec<String>,
+    category_split_cases: BTreeMap<String, BTreeMap<String, usize>>,
+    category_split_speakers: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    split_speakers: BTreeMap<String, BTreeSet<String>>,
+    speaker_splits: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl AudioGoldenSummary {
-    pub fn complete_coverage(&self) -> bool {
-        self.wake_positive > 0
-            && self.near_wake_negative > 0
-            && self.other_speech > 0
-            && self.background > 0
-    }
-
     pub fn speaker_disjoint(&self) -> bool {
         self.speaker_split_conflicts.is_empty()
+    }
+
+    pub fn category_cases(&self, split: &str, category: &str) -> usize {
+        self.category_split_cases
+            .get(split)
+            .and_then(|categories| categories.get(category))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn category_speakers(&self, split: &str, category: &str) -> usize {
+        self.category_split_speakers
+            .get(split)
+            .and_then(|categories| categories.get(category))
+            .map(BTreeSet::len)
+            .unwrap_or_default()
+    }
+
+    pub fn split_speakers(&self, split: &str) -> usize {
+        self.split_speakers
+            .get(split)
+            .map(BTreeSet::len)
+            .unwrap_or_default()
+    }
+
+    pub fn assigned_splits(&self, speaker_id: &str) -> Vec<String> {
+        self.speaker_splits
+            .get(&speaker_id.trim().to_ascii_lowercase())
+            .map(|splits| splits.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn category_ready(
+        &self,
+        campaign: &AudioCampaignConfig,
+        split: &str,
+        category: &str,
+    ) -> bool {
+        let target = campaign.split_target(split);
+        self.category_cases(split, category) >= target.minimum_cases_per_category
+            && self.category_speakers(split, category) >= target.minimum_speakers_per_category
+    }
+
+    pub fn campaign_ready(&self, campaign: &AudioCampaignConfig) -> bool {
+        self.speaker_disjoint()
+            && ["calibration", "test"].into_iter().all(|split| {
+                campaign
+                    .categories
+                    .iter()
+                    .all(|category| self.category_ready(campaign, split, &category.key))
+            })
+    }
+
+    pub fn next_campaign_target(
+        &self,
+        campaign: &AudioCampaignConfig,
+        split: &str,
+    ) -> Option<AudioCampaignTarget> {
+        let target = campaign.split_target(split);
+        let category = campaign
+            .categories
+            .iter()
+            .filter(|category| !self.category_ready(campaign, split, &category.key))
+            .min_by_key(|category| {
+                let cases = self.category_cases(split, &category.key);
+                let speakers = self.category_speakers(split, &category.key);
+                let case_progress =
+                    cases.saturating_mul(1_000) / target.minimum_cases_per_category.max(1);
+                let speaker_progress =
+                    speakers.saturating_mul(1_000) / target.minimum_speakers_per_category.max(1);
+                (case_progress.min(speaker_progress), cases, speakers)
+            })?;
+        let cases = self.category_cases(split, &category.key);
+        let speakers = self.category_speakers(split, &category.key);
+        let prompt = category.prompts.get(cases % category.prompts.len())?;
+        Some(AudioCampaignTarget {
+            category: category.key.clone(),
+            label: category.label.clone(),
+            prompt: prompt.prompt.clone(),
+            instruction: prompt.instruction.clone(),
+            cases,
+            case_target: target.minimum_cases_per_category,
+            speakers,
+            speaker_target: target.minimum_speakers_per_category,
+        })
     }
 }
 
@@ -178,6 +321,8 @@ pub struct AudioGoldenBenchmarkSummary {
     pub report_path: PathBuf,
     pub total_cases: usize,
     pub speaker_disjoint: bool,
+    pub promotion_eligible: bool,
+    pub promotion_reasons: Vec<String>,
     pub speech: AudioBenchmarkMetric,
     pub wake: AudioBenchmarkMetric,
 }
@@ -400,6 +545,8 @@ pub struct NativeServices {
     pub audio_evidence: Option<AudioEvidenceClip>,
     pub audio_evidence_pending: bool,
     pub audio_evidence_error: Option<String>,
+    pub audio_campaign: AudioCampaignConfig,
+    pub audio_campaign_error: Option<String>,
     pub audio_golden_summary: AudioGoldenSummary,
     pub audio_golden_last_case: Option<AudioGoldenCase>,
     pub audio_golden_error: Option<String>,
@@ -425,6 +572,10 @@ impl NativeServices {
         let root = find_hab_root();
         let configs = discover_configs(&root);
         let sessions = discover_sessions(&root);
+        let (audio_campaign, audio_campaign_error) = match load_audio_campaign(&root) {
+            Ok(campaign) => (campaign, None),
+            Err(error) => (fallback_audio_campaign(&root), Some(error)),
+        };
         let audio_golden_summary = load_audio_golden_summary(&root);
         let audio_golden_benchmark = load_audio_golden_benchmark(&root);
         let (command_tx, command_rx) = mpsc::channel();
@@ -469,6 +620,8 @@ impl NativeServices {
             audio_evidence: None,
             audio_evidence_pending: false,
             audio_evidence_error: None,
+            audio_campaign,
+            audio_campaign_error,
             audio_golden_summary,
             audio_golden_last_case: None,
             audio_golden_error: None,
@@ -865,15 +1018,21 @@ impl NativeServices {
         if !request.consent {
             return Err("confirm consent before recording private microphone data".to_owned());
         }
-        request.speaker_id = request.speaker_id.trim().to_owned();
+        request.speaker_id = request.speaker_id.trim().to_ascii_lowercase();
         request.session_id = request.session_id.trim().to_owned();
         request.prompt = request.prompt.trim().to_owned();
+        request.condition = request.condition.trim().to_owned();
         if request.speaker_id.is_empty() || request.session_id.is_empty() {
             return Err("speaker and session identifiers are required".to_owned());
         }
         if !matches!(request.split.as_str(), "calibration" | "test") {
             return Err("split must be calibration or test".to_owned());
         }
+        validate_audio_speaker_split(
+            &self.audio_golden_summary,
+            &request.speaker_id,
+            &request.split,
+        )?;
         if !matches!(
             request.category.as_str(),
             "wake_positive" | "near_wake_negative" | "other_speech" | "background"
@@ -2150,6 +2309,174 @@ fn audio_golden_manifest_path(root: &Path) -> PathBuf {
     root.join(AUDIO_GOLDEN_MANIFEST_RELATIVE)
 }
 
+fn validate_audio_speaker_split(
+    summary: &AudioGoldenSummary,
+    speaker_id: &str,
+    split: &str,
+) -> Result<(), String> {
+    let assigned_splits = summary.assigned_splits(speaker_id);
+    if assigned_splits.iter().any(|assigned| assigned != split) {
+        return Err(format!(
+            "speaker {speaker_id} already belongs to {}; choose that split or use a different stable speaker ID",
+            assigned_splits.join(" + ")
+        ));
+    }
+    Ok(())
+}
+
+fn campaign_split_target(
+    campaign: &Value,
+    split: &str,
+) -> Result<AudioCampaignSplitTarget, String> {
+    let value = campaign
+        .pointer(&format!("/splits/{split}"))
+        .ok_or_else(|| format!("audio campaign is missing the {split} split"))?;
+    let minimum_cases_per_category = value
+        .get("minimum_cases_per_category")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("audio campaign {split} case target must be positive"))?;
+    let minimum_speakers_per_category = value
+        .get("minimum_speakers_per_category")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| format!("audio campaign {split} speaker target must be positive"))?;
+    Ok(AudioCampaignSplitTarget {
+        minimum_cases_per_category,
+        minimum_speakers_per_category,
+    })
+}
+
+fn load_audio_campaign(root: &Path) -> Result<AudioCampaignConfig, String> {
+    let path = root.join(AUDIO_CAMPAIGN_RELATIVE);
+    let campaign = serde_json::from_slice::<Value>(
+        &fs::read(&path).map_err(|error| format!("audio campaign config is missing: {error}"))?,
+    )
+    .map_err(|error| format!("invalid audio campaign config: {error}"))?;
+    if campaign.get("schema").and_then(Value::as_str) != Some(AUDIO_CAMPAIGN_SCHEMA) {
+        return Err("unsupported audio campaign schema".to_owned());
+    }
+    let mut categories = Vec::new();
+    for category in campaign
+        .get("categories")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "audio campaign categories must be an array".to_owned())?
+    {
+        let key = category
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if !AUDIO_GOLDEN_CATEGORIES.contains(&key.as_str()) {
+            return Err(format!("unsupported audio campaign category: {key}"));
+        }
+        if categories
+            .iter()
+            .any(|existing: &AudioCampaignCategory| existing.key == key)
+        {
+            return Err(format!("duplicate audio campaign category: {key}"));
+        }
+        let prompts = category
+            .get("prompts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("audio campaign {key} prompts must be an array"))?
+            .iter()
+            .filter_map(|prompt| {
+                let text = prompt.get("prompt")?.as_str()?.trim();
+                let instruction = prompt.get("instruction")?.as_str()?.trim();
+                (!text.is_empty() && !instruction.is_empty()).then(|| AudioCampaignPrompt {
+                    prompt: text.to_owned(),
+                    instruction: instruction.to_owned(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if prompts.is_empty() {
+            return Err(format!("audio campaign {key} has no valid prompts"));
+        }
+        categories.push(AudioCampaignCategory {
+            key,
+            label: category
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Audio category")
+                .to_owned(),
+            prompts,
+        });
+    }
+    if categories.len() != AUDIO_GOLDEN_CATEGORIES.len()
+        || AUDIO_GOLDEN_CATEGORIES
+            .iter()
+            .any(|key| !categories.iter().any(|category| category.key == *key))
+    {
+        return Err("audio campaign must define all four required categories".to_owned());
+    }
+    Ok(AudioCampaignConfig {
+        path,
+        name: campaign
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("hab-audio-pilot-campaign")
+            .to_owned(),
+        version: campaign.get("version").and_then(Value::as_u64).unwrap_or(1),
+        calibration: campaign_split_target(&campaign, "calibration")?,
+        test: campaign_split_target(&campaign, "test")?,
+        categories,
+    })
+}
+
+fn fallback_audio_campaign(root: &Path) -> AudioCampaignConfig {
+    let category =
+        |key: &str, label: &str, prompt: &str, instruction: &str| AudioCampaignCategory {
+            key: key.to_owned(),
+            label: label.to_owned(),
+            prompts: vec![AudioCampaignPrompt {
+                prompt: prompt.to_owned(),
+                instruction: instruction.to_owned(),
+            }],
+        };
+    AudioCampaignConfig {
+        path: root.join(AUDIO_CAMPAIGN_RELATIVE),
+        name: "HAB audio pilot fallback".to_owned(),
+        version: 1,
+        calibration: AudioCampaignSplitTarget {
+            minimum_cases_per_category: 6,
+            minimum_speakers_per_category: 3,
+        },
+        test: AudioCampaignSplitTarget {
+            minimum_cases_per_category: 4,
+            minimum_speakers_per_category: 2,
+        },
+        categories: vec![
+            category(
+                "wake_positive",
+                "Wake positive",
+                "Hey chat",
+                "Natural voice.",
+            ),
+            category(
+                "near_wake_negative",
+                "Near-wake negative",
+                "Hey cat",
+                "Say the exact phrase naturally.",
+            ),
+            category(
+                "other_speech",
+                "Other speech",
+                "Read a short sentence",
+                "Speak without the wake phrase.",
+            ),
+            category(
+                "background",
+                "Background / silence",
+                "Quiet room",
+                "Do not speak.",
+            ),
+        ],
+    }
+}
+
 fn sanitize_case_component(value: &str) -> String {
     let mut sanitized = value
         .trim()
@@ -2252,6 +2579,7 @@ fn save_audio_golden_capture(
         "category": payload.request.category,
         "label": payload.request.prompt,
         "prompt": payload.request.prompt,
+        "condition": payload.request.condition,
         "expected": {"speech": expected_speech, "wake": expected_wake},
         "audio": {
             "sample_rate_hz": payload.sample_rate_hz,
@@ -2290,6 +2618,7 @@ fn save_audio_golden_capture(
         split: payload.request.split,
         category: payload.request.category,
         prompt: payload.request.prompt,
+        condition: payload.request.condition,
         duration_s,
     })
 }
@@ -2309,7 +2638,6 @@ fn load_audio_golden_summary(root: &Path) -> AudioGoldenSummary {
     if manifest.get("schema").and_then(Value::as_str) != Some(AUDIO_GOLDEN_MANIFEST_SCHEMA) {
         return summary;
     }
-    let mut speaker_splits = BTreeMap::<String, BTreeSet<String>>::new();
     for case in manifest
         .get("cases")
         .and_then(Value::as_array)
@@ -2317,32 +2645,73 @@ fn load_audio_golden_summary(root: &Path) -> AudioGoldenSummary {
         .flatten()
     {
         summary.total_cases += 1;
-        match case.get("category").and_then(Value::as_str) {
+        let category = case.get("category").and_then(Value::as_str);
+        match category {
             Some("wake_positive") => summary.wake_positive += 1,
             Some("near_wake_negative") => summary.near_wake_negative += 1,
             Some("other_speech") => summary.other_speech += 1,
             Some("background") => summary.background += 1,
             _ => {}
         }
-        match case.get("split").and_then(Value::as_str) {
+        let split = case.get("split").and_then(Value::as_str);
+        match split {
             Some("calibration") => summary.calibration_cases += 1,
             Some("test") => summary.test_cases += 1,
             _ => {}
         }
-        if let (Some(speaker), Some(split)) = (
+        if let (Some(category), Some(split)) = (category, split)
+            && AUDIO_GOLDEN_CATEGORIES.contains(&category)
+            && matches!(split, "calibration" | "test")
+        {
+            *summary
+                .category_split_cases
+                .entry(split.to_owned())
+                .or_default()
+                .entry(category.to_owned())
+                .or_default() += 1;
+            if let Some(speaker) = case
+                .get("speaker_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|speaker| !speaker.is_empty())
+            {
+                let speaker = speaker.to_ascii_lowercase();
+                summary
+                    .category_split_speakers
+                    .entry(split.to_owned())
+                    .or_default()
+                    .entry(category.to_owned())
+                    .or_default()
+                    .insert(speaker.clone());
+                summary
+                    .split_speakers
+                    .entry(split.to_owned())
+                    .or_default()
+                    .insert(speaker.clone());
+                summary
+                    .speaker_splits
+                    .entry(speaker)
+                    .or_default()
+                    .insert(split.to_owned());
+            }
+        } else if let (Some(speaker), Some(split)) = (
             case.get("speaker_id").and_then(Value::as_str),
             case.get("split").and_then(Value::as_str),
         ) {
-            speaker_splits
-                .entry(speaker.to_owned())
+            let speaker = speaker.trim().to_ascii_lowercase();
+            summary
+                .speaker_splits
+                .entry(speaker)
                 .or_default()
                 .insert(split.to_owned());
         }
     }
-    summary.speakers = speaker_splits.len();
-    summary.speaker_split_conflicts = speaker_splits
-        .into_iter()
+    summary.speakers = summary.speaker_splits.len();
+    summary.speaker_split_conflicts = summary
+        .speaker_splits
+        .iter()
         .filter_map(|(speaker, splits)| (splits.len() > 1).then_some(speaker))
+        .cloned()
         .collect();
     summary
 }
@@ -2395,6 +2764,18 @@ fn load_audio_golden_benchmark_from_path(path: &Path) -> Option<AudioGoldenBench
             .get("speaker_disjoint")
             .and_then(Value::as_bool)
             .unwrap_or(true),
+        promotion_eligible: report
+            .pointer("/promotion_gate/eligible")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        promotion_reasons: report
+            .pointer("/promotion_gate/reasons")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
         speech: benchmark_metric(report.pointer("/tasks/speech").unwrap_or(&Value::Null)),
         wake: benchmark_metric(report.pointer("/tasks/wake").unwrap_or(&Value::Null)),
     })
@@ -3584,6 +3965,7 @@ mod tests {
                         split: split.to_owned(),
                         category: category.to_owned(),
                         prompt: prompt.to_owned(),
+                        condition: "unit-test condition".to_owned(),
                         duration_ms: 100,
                         consent: true,
                     },
@@ -3614,15 +3996,62 @@ mod tests {
             json!({"speech": false, "wake": false})
         );
         assert_eq!(cases[0]["sha256"].as_str().map(str::len), Some(64));
+        assert_eq!(cases[0]["condition"], "unit-test condition");
 
         let summary = load_audio_golden_summary(&root);
         assert_eq!(summary.total_cases, 2);
         assert_eq!(summary.wake_positive, 1);
         assert_eq!(summary.background, 1);
         assert_eq!(summary.speakers, 1);
+        assert_eq!(summary.category_cases("calibration", "wake_positive"), 1);
+        assert_eq!(summary.category_speakers("calibration", "wake_positive"), 1);
+        assert_eq!(
+            summary.assigned_splits(" SPEAKER-A "),
+            ["calibration", "test"]
+        );
         assert_eq!(summary.speaker_split_conflicts, ["speaker-a"]);
         assert!(!summary.speaker_disjoint());
+        assert!(validate_audio_speaker_split(&summary, "speaker-a", "test").is_err());
+        assert!(validate_audio_speaker_split(&summary, "new-speaker", "test").is_ok());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn campaign_requires_every_split_category_and_disjoint_speakers() {
+        let campaign = fallback_audio_campaign(Path::new("campaign-test"));
+        let mut summary = AudioGoldenSummary::default();
+        let first = summary
+            .next_campaign_target(&campaign, "calibration")
+            .expect("first target");
+        assert_eq!(first.category, "wake_positive");
+        assert_eq!(first.prompt, "Hey chat");
+        assert!(!summary.campaign_ready(&campaign));
+
+        for split in ["calibration", "test"] {
+            let target = campaign.split_target(split);
+            for category in &campaign.categories {
+                summary
+                    .category_split_cases
+                    .entry(split.to_owned())
+                    .or_default()
+                    .insert(category.key.clone(), target.minimum_cases_per_category);
+                let speakers = (0..target.minimum_speakers_per_category)
+                    .map(|index| format!("{split}-speaker-{index}"))
+                    .collect::<BTreeSet<_>>();
+                summary
+                    .category_split_speakers
+                    .entry(split.to_owned())
+                    .or_default()
+                    .insert(category.key.clone(), speakers);
+            }
+        }
+        assert!(summary.campaign_ready(&campaign));
+        assert!(summary.next_campaign_target(&campaign, "test").is_none());
+
+        summary
+            .speaker_split_conflicts
+            .push("leaked-speaker".to_owned());
+        assert!(!summary.campaign_ready(&campaign));
     }
 }
