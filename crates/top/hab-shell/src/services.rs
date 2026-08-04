@@ -6,7 +6,7 @@
 //! process work runs on a worker thread so a slow device can never stall egui.
 
 use std::{
-    collections::{VecDeque, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, VecDeque, hash_map::DefaultHasher},
     fs,
     hash::{Hash as _, Hasher as _},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
@@ -19,6 +19,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tungstenite::{Message, connect};
 
 const ENGINE_ENDPOINT: &str = "ws://127.0.0.1:9999";
@@ -55,6 +56,8 @@ const MAX_TIMELINE_EVENTS: usize = 250;
 const MAX_AUDIO_LEVELS: usize = 320;
 const MAX_LIVE_AUDIO_NS: i64 = 30_000_000_000;
 const AUDIO_EVIDENCE_WINDOW_MS: u64 = 1_000;
+const AUDIO_GOLDEN_MANIFEST_SCHEMA: &str = "hab.inspector-recorded-audio.v1";
+const AUDIO_GOLDEN_MANIFEST_RELATIVE: &str = "data/golden_sets/audio/manifest.json";
 
 #[derive(Clone, Debug, Default)]
 pub struct EngineSnapshot {
@@ -109,6 +112,92 @@ pub struct AudioEvidenceClip {
     pub channels: u16,
     pub frames: usize,
     pub levels: Vec<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioGoldenCaptureRequest {
+    pub speaker_id: String,
+    pub session_id: String,
+    pub split: String,
+    pub category: String,
+    pub prompt: String,
+    pub duration_ms: u64,
+    pub consent: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioGoldenCase {
+    pub id: String,
+    pub wav_path: PathBuf,
+    pub speaker_id: String,
+    pub split: String,
+    pub category: String,
+    pub prompt: String,
+    pub duration_s: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AudioGoldenSummary {
+    pub manifest_path: PathBuf,
+    pub total_cases: usize,
+    pub wake_positive: usize,
+    pub near_wake_negative: usize,
+    pub other_speech: usize,
+    pub background: usize,
+    pub calibration_cases: usize,
+    pub test_cases: usize,
+    pub speakers: usize,
+    pub speaker_split_conflicts: Vec<String>,
+}
+
+impl AudioGoldenSummary {
+    pub fn complete_coverage(&self) -> bool {
+        self.wake_positive > 0
+            && self.near_wake_negative > 0
+            && self.other_speech > 0
+            && self.background > 0
+    }
+
+    pub fn speaker_disjoint(&self) -> bool {
+        self.speaker_split_conflicts.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AudioBenchmarkMetric {
+    pub true_positive: u64,
+    pub false_positive: u64,
+    pub true_negative: u64,
+    pub false_negative: u64,
+    pub f1: Option<f64>,
+    pub recommended_threshold: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioGoldenBenchmarkSummary {
+    pub report_path: PathBuf,
+    pub total_cases: usize,
+    pub speaker_disjoint: bool,
+    pub speech: AudioBenchmarkMetric,
+    pub wake: AudioBenchmarkMetric,
+}
+
+#[derive(Clone, Debug)]
+struct PendingAudioGoldenCapture {
+    request: AudioGoldenCaptureRequest,
+    start_timestamp_ns: i64,
+    end_timestamp_ns: i64,
+}
+
+#[derive(Clone, Debug)]
+struct AudioGoldenCapturePayload {
+    request: AudioGoldenCaptureRequest,
+    samples: Vec<f32>,
+    sample_rate_hz: u32,
+    channels: u16,
+    source: String,
+    start_timestamp_ns: i64,
+    end_timestamp_ns: i64,
 }
 
 impl AudioEvidenceClip {
@@ -253,6 +342,8 @@ enum WorkerCommand {
         source_path: PathBuf,
         timestamp_ns: i64,
     },
+    SaveAudioGoldenCapture(AudioGoldenCapturePayload),
+    RunAudioGoldenBenchmark(PathBuf),
     RunConfig(PathBuf),
     StopEngine,
     StartSyntheticDevice,
@@ -265,6 +356,8 @@ enum WorkerEvent {
     RecordingStopped(Result<String, String>),
     Hdf5PlaybackPrepared(Result<PreparedPlayback, String>),
     AudioEvidencePrepared(Result<AudioEvidenceClip, String>),
+    AudioGoldenCaptureSaved(Result<AudioGoldenCase, String>),
+    AudioGoldenBenchmarkFinished(Result<PathBuf, String>),
     ConfigStarted(Result<PathBuf, String>),
     EngineStopped(Result<String, String>),
 }
@@ -307,6 +400,13 @@ pub struct NativeServices {
     pub audio_evidence: Option<AudioEvidenceClip>,
     pub audio_evidence_pending: bool,
     pub audio_evidence_error: Option<String>,
+    pub audio_golden_summary: AudioGoldenSummary,
+    pub audio_golden_last_case: Option<AudioGoldenCase>,
+    pub audio_golden_error: Option<String>,
+    pub audio_golden_saving: bool,
+    pub audio_golden_benchmark_pending: bool,
+    pub audio_golden_benchmark: Option<AudioGoldenBenchmarkSummary>,
+    pending_audio_golden_capture: Option<PendingAudioGoldenCapture>,
     prepared_playback: Option<PreparedPlayback>,
     pub busy: bool,
     last_probe: Instant,
@@ -325,6 +425,8 @@ impl NativeServices {
         let root = find_hab_root();
         let configs = discover_configs(&root);
         let sessions = discover_sessions(&root);
+        let audio_golden_summary = load_audio_golden_summary(&root);
+        let audio_golden_benchmark = load_audio_golden_benchmark(&root);
         let (command_tx, command_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let (timeline_tx, timeline_rx) = mpsc::channel();
@@ -367,6 +469,13 @@ impl NativeServices {
             audio_evidence: None,
             audio_evidence_pending: false,
             audio_evidence_error: None,
+            audio_golden_summary,
+            audio_golden_last_case: None,
+            audio_golden_error: None,
+            audio_golden_saving: false,
+            audio_golden_benchmark_pending: false,
+            audio_golden_benchmark,
+            pending_audio_golden_capture: None,
             prepared_playback: None,
             busy: false,
             last_probe: Instant::now() - Duration::from_secs(10),
@@ -484,6 +593,42 @@ impl NativeServices {
                         }
                     }
                 }
+                WorkerEvent::AudioGoldenCaptureSaved(result) => {
+                    self.audio_golden_saving = false;
+                    match result {
+                        Ok(case) => {
+                            notices.push(format!(
+                                "Saved {} ({:.2} s) to the private audio golden set",
+                                case.id, case.duration_s
+                            ));
+                            self.audio_golden_last_case = Some(case);
+                            self.audio_golden_error = None;
+                            self.audio_golden_summary = load_audio_golden_summary(&self.root);
+                        }
+                        Err(error) => {
+                            self.audio_golden_error = Some(error.clone());
+                            notices.push(format!("Audio calibration capture failed: {error}"));
+                        }
+                    }
+                }
+                WorkerEvent::AudioGoldenBenchmarkFinished(result) => {
+                    self.audio_golden_benchmark_pending = false;
+                    match result {
+                        Ok(path) => {
+                            notices.push(format!(
+                                "Native audio calibration report ready: {}",
+                                path.display()
+                            ));
+                            self.audio_golden_benchmark =
+                                load_audio_golden_benchmark_from_path(&path);
+                            self.audio_golden_error = None;
+                        }
+                        Err(error) => {
+                            self.audio_golden_error = Some(error.clone());
+                            notices.push(format!("Audio calibration benchmark failed: {error}"));
+                        }
+                    }
+                }
                 WorkerEvent::ConfigStarted(result) => {
                     self.busy = false;
                     match result {
@@ -557,6 +702,7 @@ impl NativeServices {
                     }) {
                         self.audio_frames.pop_front();
                     }
+                    self.finish_audio_golden_capture_if_ready(newest_timestamp_ns);
                 }
                 TimelineListenerEvent::ModelStatus(status) => {
                     if let Some(existing) = self
@@ -707,6 +853,123 @@ impl NativeServices {
         self.audio_evidence = None;
         self.audio_evidence_pending = false;
         self.audio_evidence_error = None;
+    }
+
+    pub fn start_audio_golden_capture(
+        &mut self,
+        mut request: AudioGoldenCaptureRequest,
+    ) -> Result<(), String> {
+        if self.pending_audio_golden_capture.is_some() || self.audio_golden_saving {
+            return Err("an audio calibration capture is already active".to_owned());
+        }
+        if !request.consent {
+            return Err("confirm consent before recording private microphone data".to_owned());
+        }
+        request.speaker_id = request.speaker_id.trim().to_owned();
+        request.session_id = request.session_id.trim().to_owned();
+        request.prompt = request.prompt.trim().to_owned();
+        if request.speaker_id.is_empty() || request.session_id.is_empty() {
+            return Err("speaker and session identifiers are required".to_owned());
+        }
+        if !matches!(request.split.as_str(), "calibration" | "test") {
+            return Err("split must be calibration or test".to_owned());
+        }
+        if !matches!(
+            request.category.as_str(),
+            "wake_positive" | "near_wake_negative" | "other_speech" | "background"
+        ) {
+            return Err("unsupported audio calibration category".to_owned());
+        }
+        if request.category != "background" && request.prompt.is_empty() {
+            return Err("enter the phrase or sound being recorded".to_owned());
+        }
+        if !(1_000..=10_000).contains(&request.duration_ms) {
+            return Err("capture duration must be between 1 and 10 seconds".to_owned());
+        }
+        let start_timestamp_ns = self
+            .audio_frames
+            .back()
+            .map(|frame| frame.timestamp_ns)
+            .filter(|timestamp| *timestamp > 0)
+            .ok_or_else(|| "connect a live microphone before recording".to_owned())?;
+        let duration_ns = i64::try_from(request.duration_ms)
+            .unwrap_or_default()
+            .saturating_mul(1_000_000);
+        self.pending_audio_golden_capture = Some(PendingAudioGoldenCapture {
+            request,
+            start_timestamp_ns,
+            end_timestamp_ns: start_timestamp_ns.saturating_add(duration_ns),
+        });
+        self.audio_golden_error = None;
+        Ok(())
+    }
+
+    pub fn cancel_audio_golden_capture(&mut self) -> bool {
+        self.pending_audio_golden_capture.take().is_some()
+    }
+
+    pub fn audio_golden_capture_progress(&self) -> Option<f32> {
+        let capture = self.pending_audio_golden_capture.as_ref()?;
+        let elapsed = self
+            .audio_timestamp_ns
+            .saturating_sub(capture.start_timestamp_ns)
+            .max(0);
+        let duration = capture
+            .end_timestamp_ns
+            .saturating_sub(capture.start_timestamp_ns)
+            .max(1);
+        Some((elapsed as f64 / duration as f64).clamp(0.0, 1.0) as f32)
+    }
+
+    pub fn run_audio_golden_benchmark(&mut self) -> Result<(), String> {
+        if self.audio_golden_benchmark_pending {
+            return Err("the native audio benchmark is already running".to_owned());
+        }
+        let manifest_path = audio_golden_manifest_path(&self.root);
+        if !manifest_path.is_file() {
+            return Err("record at least one private calibration clip first".to_owned());
+        }
+        self.audio_golden_benchmark_pending = true;
+        self.audio_golden_error = None;
+        if self
+            .command_tx
+            .send(WorkerCommand::RunAudioGoldenBenchmark(manifest_path))
+            .is_err()
+        {
+            self.audio_golden_benchmark_pending = false;
+            return Err("native service worker is unavailable".to_owned());
+        }
+        Ok(())
+    }
+
+    fn finish_audio_golden_capture_if_ready(&mut self, newest_timestamp_ns: i64) {
+        if self.audio_golden_saving
+            || self
+                .pending_audio_golden_capture
+                .as_ref()
+                .is_none_or(|capture| newest_timestamp_ns < capture.end_timestamp_ns)
+        {
+            return;
+        }
+        let capture = self
+            .pending_audio_golden_capture
+            .take()
+            .expect("capture checked above");
+        match build_audio_golden_payload(&self.audio_frames, capture) {
+            Ok(payload) => {
+                self.audio_golden_saving = true;
+                if self
+                    .command_tx
+                    .send(WorkerCommand::SaveAudioGoldenCapture(payload))
+                    .is_err()
+                {
+                    self.audio_golden_saving = false;
+                    self.audio_golden_error =
+                        Some("native service worker is unavailable".to_owned());
+                }
+            }
+            Err(error) => self.audio_golden_error = Some(error),
+        }
     }
 
     pub fn set_parameter(
@@ -1521,6 +1784,15 @@ fn worker_loop(
                 &source_path,
                 timestamp_ns,
             )),
+            WorkerCommand::SaveAudioGoldenCapture(payload) => {
+                WorkerEvent::AudioGoldenCaptureSaved(save_audio_golden_capture(&root, payload))
+            }
+            WorkerCommand::RunAudioGoldenBenchmark(manifest_path) => {
+                WorkerEvent::AudioGoldenBenchmarkFinished(run_audio_golden_benchmark(
+                    &root,
+                    &manifest_path,
+                ))
+            }
             WorkerCommand::RunConfig(path) => {
                 WorkerEvent::ConfigStarted(restart_stack(&root, &path).map(|()| path))
             }
@@ -1787,6 +2059,397 @@ fn build_live_audio_evidence(
         frames: samples.len() / usize::from(channels),
         levels,
     })
+}
+
+fn build_audio_golden_payload(
+    frames: &VecDeque<AudioFrame>,
+    capture: PendingAudioGoldenCapture,
+) -> Result<AudioGoldenCapturePayload, String> {
+    let reference = frames
+        .iter()
+        .min_by_key(|frame| frame.timestamp_ns.abs_diff(capture.start_timestamp_ns))
+        .ok_or_else(|| "live audio buffer is empty".to_owned())?;
+    let sample_rate_hz = reference.sample_rate_hz;
+    let channels = reference.channels;
+    if sample_rate_hz == 0 || channels == 0 {
+        return Err("live audio format is incomplete".to_owned());
+    }
+    let channel_count = usize::from(channels);
+    let mut samples = Vec::new();
+    let mut actual_start_ns = i64::MAX;
+    let mut actual_end_ns = i64::MIN;
+    for frame in frames {
+        if frame.sample_rate_hz != sample_rate_hz || frame.channels != channels {
+            continue;
+        }
+        let frame_count = frame.samples.len() / channel_count;
+        if frame_count == 0 {
+            continue;
+        }
+        let block_end_ns = frame.timestamp_ns.saturating_add(
+            i64::try_from((frame_count as u128 * 1_000_000_000_u128) / u128::from(sample_rate_hz))
+                .unwrap_or(i64::MAX),
+        );
+        let overlap_start_ns = capture.start_timestamp_ns.max(frame.timestamp_ns);
+        let overlap_end_ns = capture.end_timestamp_ns.min(block_end_ns);
+        if overlap_end_ns <= overlap_start_ns {
+            continue;
+        }
+        let first_frame = usize::try_from(
+            (overlap_start_ns.saturating_sub(frame.timestamp_ns) as u128
+                * u128::from(sample_rate_hz))
+                / 1_000_000_000_u128,
+        )
+        .unwrap_or_default()
+        .min(frame_count);
+        let end_frame = usize::try_from(
+            (overlap_end_ns.saturating_sub(frame.timestamp_ns) as u128
+                * u128::from(sample_rate_hz))
+            .div_ceil(1_000_000_000_u128),
+        )
+        .unwrap_or(frame_count)
+        .min(frame_count);
+        if end_frame <= first_frame {
+            continue;
+        }
+        samples.extend_from_slice(
+            &frame.samples[first_frame * channel_count..end_frame * channel_count],
+        );
+        actual_start_ns = actual_start_ns.min(
+            frame.timestamp_ns.saturating_add(
+                i64::try_from(
+                    (first_frame as u128 * 1_000_000_000_u128) / u128::from(sample_rate_hz),
+                )
+                .unwrap_or_default(),
+            ),
+        );
+        actual_end_ns = actual_end_ns.max(
+            frame.timestamp_ns.saturating_add(
+                i64::try_from(
+                    (end_frame as u128 * 1_000_000_000_u128) / u128::from(sample_rate_hz),
+                )
+                .unwrap_or_default(),
+            ),
+        );
+    }
+    if samples.is_empty() {
+        return Err("no live PCM overlaps the calibration capture".to_owned());
+    }
+    Ok(AudioGoldenCapturePayload {
+        request: capture.request,
+        samples,
+        sample_rate_hz,
+        channels,
+        source: reference.source.clone(),
+        start_timestamp_ns: actual_start_ns,
+        end_timestamp_ns: actual_end_ns,
+    })
+}
+
+fn audio_golden_manifest_path(root: &Path) -> PathBuf {
+    root.join(AUDIO_GOLDEN_MANIFEST_RELATIVE)
+}
+
+fn sanitize_case_component(value: &str) -> String {
+    let mut sanitized = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while sanitized.contains("--") {
+        sanitized = sanitized.replace("--", "-");
+    }
+    sanitized.trim_matches('-').chars().take(40).collect()
+}
+
+fn expected_audio_labels(category: &str) -> Result<(bool, bool), String> {
+    match category {
+        "wake_positive" => Ok((true, true)),
+        "near_wake_negative" | "other_speech" => Ok((true, false)),
+        "background" => Ok((false, false)),
+        _ => Err(format!(
+            "unsupported audio calibration category: {category}"
+        )),
+    }
+}
+
+fn save_audio_golden_capture(
+    root: &Path,
+    payload: AudioGoldenCapturePayload,
+) -> Result<AudioGoldenCase, String> {
+    let (expected_speech, expected_wake) = expected_audio_labels(&payload.request.category)?;
+    let recorded_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let speaker_component = sanitize_case_component(&payload.request.speaker_id);
+    let category_component = sanitize_case_component(&payload.request.category);
+    if speaker_component.is_empty() || category_component.is_empty() {
+        return Err("speaker and category must contain a letter or number".to_owned());
+    }
+    let id = format!("{speaker_component}-{category_component}-{recorded_unix_ms}");
+    let manifest_path = audio_golden_manifest_path(root);
+    let corpus_root = manifest_path
+        .parent()
+        .ok_or_else(|| "audio golden manifest has no parent directory".to_owned())?;
+    let relative_wav = PathBuf::from("clips").join(format!("{id}.wav"));
+    let wav_path = corpus_root.join(&relative_wav);
+    write_pcm16_wav(
+        &wav_path,
+        &payload.samples,
+        payload.sample_rate_hz,
+        payload.channels,
+    )?;
+    let wav_bytes = fs::read(&wav_path).map_err(|error| error.to_string())?;
+    let sha256 = format!("{:x}", Sha256::digest(&wav_bytes));
+    let frames = payload.samples.len() / usize::from(payload.channels);
+    let duration_s = frames as f64 / f64::from(payload.sample_rate_hz);
+
+    let mut manifest = if manifest_path.is_file() {
+        serde_json::from_slice::<Value>(
+            &fs::read(&manifest_path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| format!("invalid audio golden manifest: {error}"))?
+    } else {
+        let template_path = root
+            .join("configs")
+            .join("models")
+            .join("inspector_recorded_audio_manifest.template.json");
+        serde_json::from_slice::<Value>(
+            &fs::read(&template_path)
+                .map_err(|error| format!("audio golden manifest template is missing: {error}"))?,
+        )
+        .map_err(|error| format!("invalid audio golden manifest template: {error}"))?
+    };
+    if manifest.get("schema").and_then(Value::as_str) != Some(AUDIO_GOLDEN_MANIFEST_SCHEMA) {
+        return Err("unsupported audio golden manifest schema".to_owned());
+    }
+    let cases = manifest
+        .get_mut("cases")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| "audio golden manifest cases must be an array".to_owned())?;
+    if cases
+        .iter()
+        .any(|case| case.get("id").and_then(Value::as_str) == Some(&id))
+    {
+        return Err(format!("audio calibration case already exists: {id}"));
+    }
+    cases.push(json!({
+        "id": id,
+        "wav": relative_wav.to_string_lossy().replace('\\', "/"),
+        "sha256": sha256,
+        "bytes": wav_bytes.len(),
+        "recorded_unix_ms": recorded_unix_ms,
+        "speaker_id": payload.request.speaker_id,
+        "session_id": payload.request.session_id,
+        "split": payload.request.split,
+        "category": payload.request.category,
+        "label": payload.request.prompt,
+        "prompt": payload.request.prompt,
+        "expected": {"speech": expected_speech, "wake": expected_wake},
+        "audio": {
+            "sample_rate_hz": payload.sample_rate_hz,
+            "channels": payload.channels,
+            "sample_format": "s16le",
+            "frames": frames,
+            "duration_s": duration_s,
+            "source": payload.source,
+            "start_timestamp_ns": payload.start_timestamp_ns,
+            "end_timestamp_ns": payload.end_timestamp_ns
+        },
+        "consent": {
+            "recorded_by_user": true,
+            "private_local_evaluation": true,
+            "redistributable": false
+        }
+    }));
+    manifest["updated_unix_ms"] = Value::from(recorded_unix_ms as u64);
+    let partial_path = manifest_path.with_extension("json.partial");
+    fs::create_dir_all(corpus_root).map_err(|error| error.to_string())?;
+    fs::write(
+        &partial_path,
+        serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    let _ = fs::remove_file(&manifest_path);
+    fs::rename(&partial_path, &manifest_path).map_err(|error| {
+        let _ = fs::remove_file(&partial_path);
+        error.to_string()
+    })?;
+
+    Ok(AudioGoldenCase {
+        id,
+        wav_path,
+        speaker_id: payload.request.speaker_id,
+        split: payload.request.split,
+        category: payload.request.category,
+        prompt: payload.request.prompt,
+        duration_s,
+    })
+}
+
+fn load_audio_golden_summary(root: &Path) -> AudioGoldenSummary {
+    let manifest_path = audio_golden_manifest_path(root);
+    let mut summary = AudioGoldenSummary {
+        manifest_path: manifest_path.clone(),
+        ..Default::default()
+    };
+    let Ok(raw) = fs::read(&manifest_path) else {
+        return summary;
+    };
+    let Ok(manifest) = serde_json::from_slice::<Value>(&raw) else {
+        return summary;
+    };
+    if manifest.get("schema").and_then(Value::as_str) != Some(AUDIO_GOLDEN_MANIFEST_SCHEMA) {
+        return summary;
+    }
+    let mut speaker_splits = BTreeMap::<String, BTreeSet<String>>::new();
+    for case in manifest
+        .get("cases")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        summary.total_cases += 1;
+        match case.get("category").and_then(Value::as_str) {
+            Some("wake_positive") => summary.wake_positive += 1,
+            Some("near_wake_negative") => summary.near_wake_negative += 1,
+            Some("other_speech") => summary.other_speech += 1,
+            Some("background") => summary.background += 1,
+            _ => {}
+        }
+        match case.get("split").and_then(Value::as_str) {
+            Some("calibration") => summary.calibration_cases += 1,
+            Some("test") => summary.test_cases += 1,
+            _ => {}
+        }
+        if let (Some(speaker), Some(split)) = (
+            case.get("speaker_id").and_then(Value::as_str),
+            case.get("split").and_then(Value::as_str),
+        ) {
+            speaker_splits
+                .entry(speaker.to_owned())
+                .or_default()
+                .insert(split.to_owned());
+        }
+    }
+    summary.speakers = speaker_splits.len();
+    summary.speaker_split_conflicts = speaker_splits
+        .into_iter()
+        .filter_map(|(speaker, splits)| (splits.len() > 1).then_some(speaker))
+        .collect();
+    summary
+}
+
+fn benchmark_metric(value: &Value) -> AudioBenchmarkMetric {
+    let metrics = value.get("metrics").unwrap_or(&Value::Null);
+    AudioBenchmarkMetric {
+        true_positive: metrics
+            .get("true_positive")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        false_positive: metrics
+            .get("false_positive")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        true_negative: metrics
+            .get("true_negative")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        false_negative: metrics
+            .get("false_negative")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        f1: metrics.get("f1").and_then(Value::as_f64),
+        recommended_threshold: value
+            .pointer("/recommended/threshold")
+            .and_then(Value::as_f64),
+    }
+}
+
+fn load_audio_golden_benchmark(root: &Path) -> Option<AudioGoldenBenchmarkSummary> {
+    load_audio_golden_benchmark_from_path(
+        &root
+            .join("artifacts")
+            .join("benchmarks")
+            .join("inspector_audio_calibration.json"),
+    )
+}
+
+fn load_audio_golden_benchmark_from_path(path: &Path) -> Option<AudioGoldenBenchmarkSummary> {
+    let report = serde_json::from_slice::<Value>(&fs::read(path).ok()?).ok()?;
+    if report.get("schema").and_then(Value::as_str) != Some("hab.inspector-eval.v1") {
+        return None;
+    }
+    let cases = report.get("cases")?.as_array()?;
+    Some(AudioGoldenBenchmarkSummary {
+        report_path: path.to_owned(),
+        total_cases: cases.len(),
+        speaker_disjoint: report
+            .get("speaker_disjoint")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        speech: benchmark_metric(report.pointer("/tasks/speech").unwrap_or(&Value::Null)),
+        wake: benchmark_metric(report.pointer("/tasks/wake").unwrap_or(&Value::Null)),
+    })
+}
+
+fn run_audio_golden_benchmark(root: &Path, manifest_path: &Path) -> Result<PathBuf, String> {
+    if !manifest_path.is_file() {
+        return Err(format!(
+            "audio golden manifest is missing: {}",
+            manifest_path.display()
+        ));
+    }
+    let script = root
+        .join("scripts")
+        .join("run-inspector-audio-calibration.ps1");
+    if !script.is_file() {
+        return Err(format!(
+            "calibration runner is missing: {}",
+            script.display()
+        ));
+    }
+    let output_path = root
+        .join("artifacts")
+        .join("benchmarks")
+        .join("inspector_audio_calibration.json");
+    let shell = if cfg!(target_os = "windows") {
+        "powershell"
+    } else {
+        "pwsh"
+    };
+    let mut command = Command::new(shell);
+    command
+        .current_dir(root)
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-RecordedManifest")
+        .arg(manifest_path)
+        .arg("-OutputPath")
+        .arg(&output_path);
+    hide_window(&mut command);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to start native audio benchmark: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("native audio benchmark exited with {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    if !output_path.is_file() {
+        return Err("native audio benchmark produced no report".to_owned());
+    }
+    Ok(output_path)
 }
 
 fn write_pcm16_wav(
@@ -2877,6 +3540,89 @@ mod tests {
         assert_eq!(clip.frames, 960);
         assert_eq!(clip.sample_rate_hz, 16_000);
         assert_eq!(clip.levels.len(), 96);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saves_private_audio_golden_cases_and_detects_speaker_leakage() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("hab-audio-golden-{nonce}"));
+        let template = root
+            .join("configs")
+            .join("models")
+            .join("inspector_recorded_audio_manifest.template.json");
+        fs::create_dir_all(template.parent().expect("template parent"))
+            .expect("create template directory");
+        fs::write(
+            &template,
+            serde_json::to_vec_pretty(&json!({
+                "schema": AUDIO_GOLDEN_MANIFEST_SCHEMA,
+                "name": "test-private-audio",
+                "version": 1,
+                "accuracy_eligible": true,
+                "license": {
+                    "kind": "private-local-evaluation",
+                    "redistributable": false,
+                    "consent_required": true
+                },
+                "cases": []
+            }))
+            .expect("serialize template"),
+        )
+        .expect("write template");
+
+        let save = |category: &str, split: &str, prompt: &str| {
+            save_audio_golden_capture(
+                &root,
+                AudioGoldenCapturePayload {
+                    request: AudioGoldenCaptureRequest {
+                        speaker_id: "speaker-a".to_owned(),
+                        session_id: "room-1".to_owned(),
+                        split: split.to_owned(),
+                        category: category.to_owned(),
+                        prompt: prompt.to_owned(),
+                        duration_ms: 100,
+                        consent: true,
+                    },
+                    samples: vec![0.25; 1_600],
+                    sample_rate_hz: 16_000,
+                    channels: 1,
+                    source: "unit-test".to_owned(),
+                    start_timestamp_ns: 1_000_000_000,
+                    end_timestamp_ns: 1_100_000_000,
+                },
+            )
+            .expect("save golden case")
+        };
+        let wake = save("wake_positive", "calibration", "Hey chat");
+        let background = save("background", "test", "HVAC");
+
+        assert!(wake.wav_path.is_file());
+        assert!(background.wav_path.is_file());
+        let manifest = serde_json::from_slice::<Value>(
+            &fs::read(audio_golden_manifest_path(&root)).expect("read manifest"),
+        )
+        .expect("parse manifest");
+        let cases = manifest["cases"].as_array().expect("manifest cases");
+        assert_eq!(cases.len(), 2);
+        assert_eq!(cases[0]["expected"], json!({"speech": true, "wake": true}));
+        assert_eq!(
+            cases[1]["expected"],
+            json!({"speech": false, "wake": false})
+        );
+        assert_eq!(cases[0]["sha256"].as_str().map(str::len), Some(64));
+
+        let summary = load_audio_golden_summary(&root);
+        assert_eq!(summary.total_cases, 2);
+        assert_eq!(summary.wake_positive, 1);
+        assert_eq!(summary.background, 1);
+        assert_eq!(summary.speakers, 1);
+        assert_eq!(summary.speaker_split_conflicts, ["speaker-a"]);
+        assert!(!summary.speaker_disjoint());
+
         let _ = fs::remove_dir_all(root);
     }
 }

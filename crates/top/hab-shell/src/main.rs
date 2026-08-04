@@ -132,6 +132,78 @@ impl PlaybackSub {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ConfigSub {
+    #[default]
+    Pipelines,
+    AudioCalibration,
+}
+
+impl ConfigSub {
+    const ALL: [Self; 2] = [Self::Pipelines, Self::AudioCalibration];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pipelines => "Pipelines",
+            Self::AudioCalibration => "Audio calibration",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AudioCaptureCategory {
+    #[default]
+    WakePositive,
+    NearWakeNegative,
+    OtherSpeech,
+    Background,
+}
+
+impl AudioCaptureCategory {
+    const ALL: [Self; 4] = [
+        Self::WakePositive,
+        Self::NearWakeNegative,
+        Self::OtherSpeech,
+        Self::Background,
+    ];
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::WakePositive => "wake_positive",
+            Self::NearWakeNegative => "near_wake_negative",
+            Self::OtherSpeech => "other_speech",
+            Self::Background => "background",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::WakePositive => "Wake positive",
+            Self::NearWakeNegative => "Near-wake negative",
+            Self::OtherSpeech => "Other speech",
+            Self::Background => "Background / silence",
+        }
+    }
+
+    fn expected(self) -> &'static str {
+        match self {
+            Self::WakePositive => "speech + wake",
+            Self::NearWakeNegative => "speech, no wake",
+            Self::OtherSpeech => "speech, no wake",
+            Self::Background => "no speech, no wake",
+        }
+    }
+
+    fn suggested_prompt(self) -> &'static str {
+        match self {
+            Self::WakePositive => "Hey chat",
+            Self::NearWakeNegative => "Hey cat",
+            Self::OtherSpeech => "Read a short sentence",
+            Self::Background => "",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum StreamSub {
     #[default]
     Line,
@@ -174,6 +246,7 @@ struct HabShell {
     workspace: Workspace,
     playback_sub: PlaybackSub,
     stream_sub: StreamSub,
+    config_sub: ConfigSub,
     pending_blueprint: bool,
     last_blueprint_error: Option<String>,
     stub_notice: Option<(String, Instant)>,
@@ -190,6 +263,13 @@ struct HabShell {
     playback_loaded_path: Option<PathBuf>,
     playback_texture: Option<egui::TextureHandle>,
     playback_texture_key: Option<(String, i64)>,
+    audio_capture_speaker: String,
+    audio_capture_session: String,
+    audio_capture_test_split: bool,
+    audio_capture_category: AudioCaptureCategory,
+    audio_capture_prompt: String,
+    audio_capture_duration_s: f32,
+    audio_capture_consent: bool,
 }
 
 impl HabShell {
@@ -213,6 +293,7 @@ impl HabShell {
             workspace: Workspace::Pipeline,
             playback_sub: PlaybackSub::Sessions,
             stream_sub: StreamSub::Line,
+            config_sub: ConfigSub::Pipelines,
             pending_blueprint: false,
             last_blueprint_error: None,
             stub_notice: None,
@@ -229,6 +310,13 @@ impl HabShell {
             playback_loaded_path: None,
             playback_texture: None,
             playback_texture_key: None,
+            audio_capture_speaker: "speaker-01".to_owned(),
+            audio_capture_session: "session-01".to_owned(),
+            audio_capture_test_split: false,
+            audio_capture_category: AudioCaptureCategory::WakePositive,
+            audio_capture_prompt: "Hey chat".to_owned(),
+            audio_capture_duration_s: 3.0,
+            audio_capture_consent: false,
         }
     }
 
@@ -438,6 +526,26 @@ impl HabShell {
                                 {
                                     self.stream_sub = sub;
                                     self.pending_blueprint = true;
+                                }
+                            }
+                        });
+                    });
+            }
+            Workspace::Configs => {
+                egui::Panel::top("hab_configs_subnav")
+                    .exact_size(38.0)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(PAPER)
+                            .inner_margin(egui::Margin::same(0))
+                            .stroke(egui::Stroke::new(1.0, BORDER_SOFT)),
+                    )
+                    .show_inside(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            for sub in ConfigSub::ALL {
+                                if subnav_button(ui, sub.label(), self.config_sub == sub).clicked()
+                                {
+                                    self.config_sub = sub;
                                 }
                             }
                         });
@@ -1312,8 +1420,12 @@ impl HabShell {
                 self.device_page(ui);
                 true
             }
-            Workspace::Configs => {
+            Workspace::Configs if self.config_sub == ConfigSub::Pipelines => {
                 self.configs_page_live(ui);
+                true
+            }
+            Workspace::Configs => {
+                self.audio_calibration_page(ui);
                 true
             }
             _ => false,
@@ -2716,6 +2828,412 @@ impl HabShell {
         }
     }
 
+    fn audio_calibration_page(&mut self, ui: &mut egui::Ui) {
+        let summary = self.services.audio_golden_summary.clone();
+        let last_case = self.services.audio_golden_last_case.clone();
+        let benchmark = self.services.audio_golden_benchmark.clone();
+        let capture_progress = self.services.audio_golden_capture_progress();
+        let capture_active = capture_progress.is_some() || self.services.audio_golden_saving;
+        let mic_live = self.services.audio_timestamp_ns > 0
+            && self.services.audio_sample_rate_hz > 0
+            && self.services.audio_channels > 0;
+        let audio_levels = self
+            .services
+            .audio_levels
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let mut start_capture = false;
+        let mut cancel_capture = false;
+        let mut run_benchmark = false;
+        let mut play_last = false;
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL)
+                    .inner_margin(egui::Margin::same(24)),
+            )
+            .show_inside(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        page_title(
+                            ui,
+                            "Audio calibration",
+                            "Record private microphone evidence and benchmark the native C++ speech and wake nodes.",
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            status_chip(
+                                ui,
+                                if mic_live { "MICROPHONE LIVE" } else { "WAITING FOR AUDIO" },
+                                if mic_live { SUCCESS } else { WARNING },
+                                if mic_live { SUCCESS_SOFT } else { PAPER },
+                            );
+                            status_chip(
+                                ui,
+                                "PRIVATE · NOT REDISTRIBUTABLE",
+                                ACCENT,
+                                INFO_SOFT,
+                            );
+                        });
+                    });
+                    ui.add_space(18.0);
+
+                    ui.columns(2, |columns| {
+                        columns[0].set_width(columns[0].available_width());
+                        info_card(&mut columns[0], |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    section_label(ui, "CAPTURE A LABELED CLIP");
+                                    ui.label(
+                                        egui::RichText::new("Speak after pressing record")
+                                            .size(15.0)
+                                            .strong()
+                                            .color(TEXT),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        outlined_chip(
+                                            ui,
+                                            &format!(
+                                                "{} HZ · {} CH",
+                                                self.services.audio_sample_rate_hz,
+                                                self.services.audio_channels
+                                            ),
+                                        );
+                                    },
+                                );
+                            });
+                            ui.add_space(16.0);
+
+                            ui.add_enabled_ui(!capture_active, |ui| {
+                                ui.columns(2, |fields| {
+                                    field_label(&mut fields[0], "SPEAKER ID");
+                                    fields[0].add(
+                                        egui::TextEdit::singleline(&mut self.audio_capture_speaker)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                    field_label(&mut fields[1], "SESSION ID");
+                                    fields[1].add(
+                                        egui::TextEdit::singleline(&mut self.audio_capture_session)
+                                            .desired_width(f32::INFINITY),
+                                    );
+                                });
+                                ui.add_space(14.0);
+                                field_label(ui, "SPLIT");
+                                ui.horizontal(|ui| {
+                                    if capture_option_button(
+                                        ui,
+                                        "Calibration",
+                                        !self.audio_capture_test_split,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.audio_capture_test_split = false;
+                                    }
+                                    if capture_option_button(
+                                        ui,
+                                        "Held-out test",
+                                        self.audio_capture_test_split,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.audio_capture_test_split = true;
+                                    }
+                                });
+                                ui.add_space(14.0);
+                                field_label(ui, "EXPECTED EVENT");
+                                ui.columns(2, |category_columns| {
+                                    for (index, category) in
+                                        AudioCaptureCategory::ALL.into_iter().enumerate()
+                                    {
+                                        let column = &mut category_columns[index % 2];
+                                        if audio_category_button(
+                                            column,
+                                            category,
+                                            self.audio_capture_category == category,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.audio_capture_category = category;
+                                            self.audio_capture_prompt =
+                                                category.suggested_prompt().to_owned();
+                                        }
+                                        if index == 1 {
+                                            category_columns[0].add_space(8.0);
+                                            category_columns[1].add_space(8.0);
+                                        }
+                                    }
+                                });
+                                ui.add_space(14.0);
+                                field_label(ui, "PHRASE OR SOUND");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.audio_capture_prompt)
+                                        .hint_text(if self.audio_capture_category
+                                            == AudioCaptureCategory::Background
+                                        {
+                                            "Optional: HVAC, typing, silence…"
+                                        } else {
+                                            "Exact words spoken"
+                                        })
+                                        .desired_width(f32::INFINITY),
+                                );
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    field_label(ui, "DURATION");
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.audio_capture_duration_s,
+                                            1.0..=8.0,
+                                        )
+                                        .suffix(" sec")
+                                        .step_by(0.5),
+                                    );
+                                });
+                                ui.add_space(10.0);
+                                ui.checkbox(
+                                    &mut self.audio_capture_consent,
+                                    "I consent to recording this microphone clip for private local model evaluation.",
+                                );
+                            });
+
+                            ui.add_space(16.0);
+                            let (waveform_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), 106.0),
+                                egui::Sense::hover(),
+                            );
+                            paint_audio_waveform(
+                                ui.painter(),
+                                waveform_rect,
+                                &audio_levels,
+                                self.services.audio_rms,
+                                self.services.audio_peak,
+                            );
+                            ui.add_space(12.0);
+
+                            if let Some(progress) = capture_progress {
+                                ui.add(
+                                    egui::ProgressBar::new(progress)
+                                        .animate(true)
+                                        .show_percentage()
+                                        .text("RECORDING LIVE PCM"),
+                                );
+                                ui.add_space(8.0);
+                                if outline_button(ui, "CANCEL").clicked() {
+                                    cancel_capture = true;
+                                }
+                            } else if self.services.audio_golden_saving {
+                                ui.add(
+                                    egui::ProgressBar::new(1.0)
+                                        .animate(true)
+                                        .text("HASHING + SAVING"),
+                                );
+                            } else if dark_button(ui, "RECORD LABELED CLIP").clicked() {
+                                start_capture = true;
+                            }
+
+                            if let Some(error) = &self.services.audio_golden_error {
+                                ui.add_space(10.0);
+                                ui.colored_label(egui::Color32::DARK_RED, error);
+                            }
+                        });
+
+                        columns[1].vertical(|ui| {
+                            info_card(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    section_label(ui, "GOLDEN-SET COVERAGE");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            status_chip(
+                                                ui,
+                                                if summary.complete_coverage() {
+                                                    "4/4 COVERED"
+                                                } else {
+                                                    "COVERAGE INCOMPLETE"
+                                                },
+                                                if summary.complete_coverage() {
+                                                    SUCCESS
+                                                } else {
+                                                    WARNING
+                                                },
+                                                if summary.complete_coverage() {
+                                                    SUCCESS_SOFT
+                                                } else {
+                                                    PAPER
+                                                },
+                                            );
+                                        },
+                                    );
+                                });
+                                calibration_coverage_row(
+                                    ui,
+                                    "Wake positives",
+                                    summary.wake_positive,
+                                    "‘Hey chat’ from each speaker",
+                                );
+                                calibration_coverage_row(
+                                    ui,
+                                    "Near-wake negatives",
+                                    summary.near_wake_negative,
+                                    "Similar phrases that must not wake",
+                                );
+                                calibration_coverage_row(
+                                    ui,
+                                    "Other speech",
+                                    summary.other_speech,
+                                    "Speech without the wake phrase",
+                                );
+                                calibration_coverage_row(
+                                    ui,
+                                    "Background / silence",
+                                    summary.background,
+                                    "No-speech operating conditions",
+                                );
+                                ui.separator();
+                                key_value(ui, "Total private clips", &summary.total_cases.to_string());
+                                key_value(ui, "Speakers", &summary.speakers.to_string());
+                                key_value(
+                                    ui,
+                                    "Calibration / test",
+                                    &format!(
+                                        "{} / {}",
+                                        summary.calibration_cases, summary.test_cases
+                                    ),
+                                );
+                                key_value(
+                                    ui,
+                                    "Speaker split",
+                                    if summary.speaker_disjoint() {
+                                        "disjoint"
+                                    } else {
+                                        "LEAKAGE DETECTED"
+                                    },
+                                );
+                                ui.label(
+                                    egui::RichText::new(summary.manifest_path.to_string_lossy())
+                                        .size(8.5)
+                                        .monospace()
+                                        .color(TERTIARY),
+                                );
+                            });
+                            ui.add_space(12.0);
+
+                            info_card(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    section_label(ui, "NATIVE C++ BENCHMARK");
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if self.services.audio_golden_benchmark_pending {
+                                                status_chip(ui, "RUNNING", WARNING, PAPER);
+                                            } else if benchmark.is_some() {
+                                                status_chip(ui, "REPORT READY", SUCCESS, SUCCESS_SOFT);
+                                            }
+                                        },
+                                    );
+                                });
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Runs recorded WAVs and the licensed baseline through the same Silero and Vosk nodes used by inspector_live.",
+                                    )
+                                    .size(10.5)
+                                    .color(MUTED),
+                                );
+                                ui.add_space(12.0);
+                                if let Some(report) = &benchmark {
+                                    benchmark_metric_row(ui, "Speech", &report.speech);
+                                    benchmark_metric_row(ui, "Wake", &report.wake);
+                                    key_value(ui, "Evaluated cases", &report.total_cases.to_string());
+                                    key_value(
+                                        ui,
+                                        "Speaker split",
+                                        if report.speaker_disjoint {
+                                            "disjoint"
+                                        } else {
+                                            "LEAKAGE DETECTED"
+                                        },
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(report.report_path.to_string_lossy())
+                                            .size(8.5)
+                                            .monospace()
+                                            .color(TERTIARY),
+                                    );
+                                    ui.add_space(10.0);
+                                }
+                                if !self.services.audio_golden_benchmark_pending
+                                    && dark_button(ui, "RUN NATIVE BENCHMARK").clicked()
+                                {
+                                    run_benchmark = true;
+                                }
+                            });
+
+                            if let Some(case) = &last_case {
+                                ui.add_space(12.0);
+                                info_card(ui, |ui| {
+                                    section_label(ui, "LAST SAVED CLIP");
+                                    ui.label(
+                                        egui::RichText::new(&case.prompt)
+                                            .size(13.0)
+                                            .strong()
+                                            .color(TEXT),
+                                    );
+                                    key_value(ui, "Speaker", &case.speaker_id);
+                                    key_value(ui, "Split", &case.split);
+                                    key_value(ui, "Category", &case.category);
+                                    key_value(ui, "Duration", &format!("{:.2} s", case.duration_s));
+                                    if outline_button(ui, "PLAY LAST CLIP").clicked() {
+                                        play_last = true;
+                                    }
+                                });
+                            }
+                        });
+                    });
+                    ui.add_space(16.0);
+                    notice_card(
+                        ui,
+                        "Keep speakers disjoint",
+                        "A speaker ID must belong to only one split. Use calibration clips to tune thresholds and held-out test clips only for final reporting. Private recordings remain under ignored data/golden_sets and are never added to Git.",
+                    );
+                });
+            });
+
+        if start_capture {
+            let request = services::AudioGoldenCaptureRequest {
+                speaker_id: self.audio_capture_speaker.clone(),
+                session_id: self.audio_capture_session.clone(),
+                split: if self.audio_capture_test_split {
+                    "test"
+                } else {
+                    "calibration"
+                }
+                .to_owned(),
+                category: self.audio_capture_category.key().to_owned(),
+                prompt: self.audio_capture_prompt.clone(),
+                duration_ms: (self.audio_capture_duration_s * 1_000.0).round() as u64,
+                consent: self.audio_capture_consent,
+            };
+            if let Err(error) = self.services.start_audio_golden_capture(request) {
+                self.show_stub_notice(format!("Audio capture not started: {error}"));
+            }
+        }
+        if cancel_capture && self.services.cancel_audio_golden_capture() {
+            self.show_stub_notice("Audio calibration capture canceled");
+        }
+        if run_benchmark && let Err(error) = self.services.run_audio_golden_benchmark() {
+            self.show_stub_notice(format!("Benchmark not started: {error}"));
+        }
+        if play_last && let Some(case) = last_case {
+            match play_wav_file(&case.wav_path) {
+                Ok(()) => self.show_stub_notice("Playing the last private calibration clip"),
+                Err(error) => self.show_stub_notice(error),
+            }
+        }
+    }
+
     #[allow(dead_code)]
     fn configs_page_live_legacy(&mut self, ui: &mut egui::Ui) {
         let configs = self.services.configs.clone();
@@ -2969,6 +3487,9 @@ impl eframe::App for HabShell {
                 || self.workspace == Workspace::Live
                 || (self.workspace == Workspace::Playback
                     && self.playback_sub == PlaybackSub::Canvas)
+                || (self.workspace == Workspace::Configs
+                    && self.config_sub == ConfigSub::AudioCalibration
+                    && self.services.audio_golden_capture_progress().is_some())
             {
                 50
             } else {
@@ -3805,6 +4326,125 @@ fn section_label(ui: &mut egui::Ui, label: &str) {
             .color(TERTIARY)
             .extra_letter_spacing(1.1),
     );
+    ui.add_space(8.0);
+}
+
+fn field_label(ui: &mut egui::Ui, label: &str) {
+    ui.label(
+        egui::RichText::new(label)
+            .size(8.5)
+            .strong()
+            .color(TERTIARY)
+            .extra_letter_spacing(0.8),
+    );
+    ui.add_space(4.0);
+}
+
+fn capture_option_button(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(10.0)
+                .strong()
+                .color(if selected { ACCENT } else { MUTED }),
+        )
+        .fill(if selected { INFO_SOFT } else { PAPER })
+        .stroke(egui::Stroke::new(
+            1.0,
+            if selected { ACCENT } else { BORDER },
+        ))
+        .corner_radius(6.0)
+        .min_size(egui::vec2(132.0, 32.0)),
+    )
+}
+
+fn audio_category_button(
+    ui: &mut egui::Ui,
+    category: AudioCaptureCategory,
+    selected: bool,
+) -> egui::Response {
+    let response = egui::Frame::new()
+        .fill(if selected { INFO_SOFT } else { PAPER })
+        .stroke(egui::Stroke::new(
+            if selected { 1.5 } else { 1.0 },
+            if selected { ACCENT } else { BORDER },
+        ))
+        .corner_radius(7.0)
+        .inner_margin(egui::Margin::same(11))
+        .show(ui, |ui| {
+            ui.set_min_height(54.0);
+            ui.label(
+                egui::RichText::new(category.label())
+                    .size(10.5)
+                    .strong()
+                    .color(TEXT),
+            );
+            ui.label(
+                egui::RichText::new(category.expected())
+                    .size(9.0)
+                    .color(if selected { ACCENT } else { TERTIARY }),
+            );
+        })
+        .response;
+    ui.interact(
+        response.rect,
+        ui.id().with(("audio-category", category.key())),
+        egui::Sense::click(),
+    )
+}
+
+fn calibration_coverage_row(ui: &mut egui::Ui, label: &str, count: usize, detail: &str) {
+    egui::Frame::new()
+        .fill(if count > 0 { SUCCESS_SOFT } else { PANEL })
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(11, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                status_dot(ui, if count > 0 { SUCCESS } else { TERTIARY });
+                ui.vertical(|ui| {
+                    ui.label(egui::RichText::new(label).size(10.0).strong().color(TEXT));
+                    ui.label(egui::RichText::new(detail).size(8.5).color(MUTED));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(count.to_string())
+                            .size(15.0)
+                            .strong()
+                            .monospace()
+                            .color(if count > 0 { SUCCESS } else { TERTIARY }),
+                    );
+                });
+            });
+        });
+    ui.add_space(6.0);
+}
+
+fn benchmark_metric_row(ui: &mut egui::Ui, label: &str, metric: &services::AudioBenchmarkMetric) {
+    let f1 = metric
+        .f1
+        .map_or_else(|| "F1 --".to_owned(), |value| format!("F1 {value:.3}"));
+    egui::Frame::new()
+        .fill(PANEL)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(label).size(10.5).strong().color(TEXT));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    outlined_chip(ui, &f1);
+                });
+            });
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                outlined_chip(ui, &format!("TP {}", metric.true_positive));
+                outlined_chip(ui, &format!("FP {}", metric.false_positive));
+                outlined_chip(ui, &format!("TN {}", metric.true_negative));
+                outlined_chip(ui, &format!("FN {}", metric.false_negative));
+                if let Some(threshold) = metric.recommended_threshold {
+                    outlined_chip(ui, &format!("RECOMMENDED {threshold:.2}"));
+                }
+            });
+        });
     ui.add_space(8.0);
 }
 
