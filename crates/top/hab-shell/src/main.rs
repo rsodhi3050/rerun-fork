@@ -41,6 +41,7 @@ const SUCCESS: egui::Color32 = egui::Color32::from_rgb(0x2e, 0x7d, 0x4f);
 const SUCCESS_SOFT: egui::Color32 = egui::Color32::from_rgb(0xe8, 0xf5, 0xed);
 const WARNING: egui::Color32 = egui::Color32::from_rgb(0xb8, 0x86, 0x0b);
 const INFO_SOFT: egui::Color32 = egui::Color32::from_rgb(0xec, 0xf4, 0xfb);
+const LIVE_STREAM: egui::Color32 = egui::Color32::from_rgb(0x2e, 0xb8, 0xc6);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Workspace {
@@ -1142,7 +1143,7 @@ impl HabShell {
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new(
-                        "Select a node to inspect its ports and hot-edit parameters in the running C++ graph.",
+                        "Inspect live transforms and the configured capture, evaluation, and promotion path.",
                     )
                     .size(12.0)
                     .color(MUTED),
@@ -1170,6 +1171,15 @@ impl HabShell {
                             });
                             ui.add_space(12.0);
                             key_value(ui, "Runtime", &node.language);
+                            key_value(
+                                ui,
+                                "Execution",
+                                if node.graph_only {
+                                    "Operator-triggered"
+                                } else {
+                                    "Continuous stream"
+                                },
+                            );
                             key_value(ui, "Inputs", &node.inputs.len().to_string());
                             key_value(ui, "Outputs", &node.outputs.len().to_string());
                             if let Some(metric) = &selected_metric {
@@ -1230,7 +1240,15 @@ impl HabShell {
                             }
                         });
                         ui.add_space(18.0);
-                        section_label(ui, "LIVE PARAMETERS");
+                        let graph_only = node.graph_only;
+                        section_label(
+                            ui,
+                            if graph_only {
+                                "CONFIGURED PARAMETERS"
+                            } else {
+                                "LIVE PARAMETERS"
+                            },
+                        );
                         if node.parameters.is_empty() {
                             ui.label(
                                 egui::RichText::new("This transform declares no parameters.")
@@ -1250,9 +1268,10 @@ impl HabShell {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut parameter.value)
                                         .font(egui::TextStyle::Monospace)
-                                        .desired_width(205.0),
+                                        .desired_width(if graph_only { 285.0 } else { 205.0 })
+                                        .interactive(!graph_only),
                                 );
-                                if outline_button(ui, "APPLY").clicked() {
+                                if !graph_only && outline_button(ui, "APPLY").clicked() {
                                     apply_parameter = Some((
                                         node.id.clone(),
                                         parameter.name.clone(),
@@ -1318,6 +1337,21 @@ impl HabShell {
     }
 
     fn pipeline_page(&mut self, ui: &mut egui::Ui) {
+        if let Some(metrics) = &self.services.pipeline_metrics {
+            let snapshots = metrics
+                .streams
+                .iter()
+                .map(|stream| pipeline_ui::StreamActivitySnapshot {
+                    name: stream.name.clone(),
+                    frequency_hz: stream.frequency_hz,
+                    input_lag_ms: stream.input_lag_ms,
+                    batch_size: stream.batch_size,
+                    total_samples: stream.total_samples,
+                })
+                .collect::<Vec<_>>();
+            self.pipeline.update_stream_activity(&snapshots);
+        }
+        let live_streams = self.pipeline.live_stream_count();
         let ready_models = self
             .services
             .model_statuses
@@ -1391,6 +1425,24 @@ impl HabShell {
                             },
                             if ready_models == 4 {
                                 SUCCESS_SOFT
+                            } else {
+                                PAPER
+                            },
+                        );
+                        status_chip(
+                            ui,
+                            &if live_streams > 0 {
+                                format!("{live_streams} LIVE STREAMS")
+                            } else {
+                                "NO LIVE FLOW".to_owned()
+                            },
+                            if live_streams > 0 {
+                                LIVE_STREAM
+                            } else {
+                                TERTIARY
+                            },
+                            if live_streams > 0 {
+                                LIVE_STREAM.gamma_multiply(0.10)
                             } else {
                                 PAPER
                             },
@@ -3714,20 +3766,23 @@ impl eframe::App for HabShell {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        ui.ctx().request_repaint_after(Duration::from_millis(
-            if self.workspace == Workspace::Timeline
-                || self.workspace == Workspace::Live
-                || (self.workspace == Workspace::Playback
-                    && self.playback_sub == PlaybackSub::Canvas)
-                || (self.workspace == Workspace::Configs
-                    && self.config_sub == ConfigSub::AudioCalibration
-                    && self.services.audio_golden_capture_progress().is_some())
-            {
-                50
-            } else {
-                250
-            },
-        ));
+        let repaint_ms = if self.workspace == Workspace::Pipeline
+            && self.pipeline.has_live_activity()
+        {
+            33
+        } else if self.workspace == Workspace::Timeline
+            || self.workspace == Workspace::Live
+            || (self.workspace == Workspace::Playback && self.playback_sub == PlaybackSub::Canvas)
+            || (self.workspace == Workspace::Configs
+                && self.config_sub == ConfigSub::AudioCalibration
+                && self.services.audio_golden_capture_progress().is_some())
+        {
+            50
+        } else {
+            250
+        };
+        ui.ctx()
+            .request_repaint_after(Duration::from_millis(repaint_ms));
         for notice in self.services.poll() {
             self.show_stub_notice(notice);
         }
